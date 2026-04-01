@@ -51,7 +51,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: '0.15.2'
+          version: ${{ matrix.zig-version }}
 
       - name: Check formatting
         run: zig fmt --check src/ examples/
@@ -69,7 +69,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: '0.15.2'
+          version: ${{ matrix.zig-version }}
 
       - name: Run tests with coverage
         run: |

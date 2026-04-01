@@ -1,0 +1,20 @@
+# Force LF line endings for all Zig source files
+*.zig text eol=lf
+*.zon text eol=lf
+
+# Shell scripts must use LF
+*.sh text eol=lf
+
+# Batch files can use CRLF on Windows
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# General text files
+*.md text eol=lf
+*.txt text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Denote files that are truly binary and should not be modified
+*.db binary
+*.wal binary

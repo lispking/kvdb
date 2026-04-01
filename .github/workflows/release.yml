@@ -4,8 +4,6 @@ on:
   push:
     tags:
       - 'v*'
-    branches:
-      - main
 
 permissions:
   contents: write
@@ -49,50 +47,68 @@ jobs:
         with:
           version: '0.15.2'
 
-      - name: Determine version
-        id: version
-        shell: bash
-        run: |
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            VERSION="${{ github.ref_name }}"
-          else
-            VERSION="latest"
-          fi
-          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
-          echo "Version: $VERSION"
-
       - name: Build
         run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
         shell: bash
 
-      - name: Package (Unix)
+      - name: Package (Versioned)
         if: matrix.os != 'windows-latest'
         run: |
-          mkdir -p kvdb-${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}
-          cp zig-out/lib/* kvdb-${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}/ 2>/dev/null || true
-          cp zig-out/bin/kvdb-cli kvdb-${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}/ 2>/dev/null || cp zig-out/bin/kvdb-cli.exe kvdb-${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}/ 2>/dev/null || true
-          cp README.md LICENSE kvdb-${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}/ 2>/dev/null || true
-          tar czvf kvdb-${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}.tar.gz kvdb-${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}
+          mkdir -p kvdb-${{ github.ref_name }}-${{ matrix.arch }}
+          cp zig-out/lib/* kvdb-${{ github.ref_name }}-${{ matrix.arch }}/ 2>/dev/null || true
+          cp zig-out/bin/kvdb-cli kvdb-${{ github.ref_name }}-${{ matrix.arch }}/ 2>/dev/null || true
+          cp README.md LICENSE kvdb-${{ github.ref_name }}-${{ matrix.arch }}/ 2>/dev/null || true
+          tar czvf kvdb-${{ github.ref_name }}-${{ matrix.arch }}.tar.gz kvdb-${{ github.ref_name }}-${{ matrix.arch }}
         shell: bash
 
-      - name: Package (Windows)
+      - name: Package (Versioned Windows)
         if: matrix.os == 'windows-latest'
         run: |
-          New-Item -ItemType Directory -Force -Path "kvdb-${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}"
-          Copy-Item zig-out/lib/* "kvdb-${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}/" -ErrorAction SilentlyContinue
-          Copy-Item zig-out/bin/kvdb-cli.exe "kvdb-${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}/" -ErrorAction SilentlyContinue
-          Copy-Item README.md "kvdb-${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}/" -ErrorAction SilentlyContinue
-          Copy-Item LICENSE "kvdb-${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}/" -ErrorAction SilentlyContinue
-          Compress-Archive -Path "kvdb-${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}" -DestinationPath "kvdb-${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}.zip" -Force
+          New-Item -ItemType Directory -Force -Path "kvdb-${{ github.ref_name }}-${{ matrix.arch }}"
+          Copy-Item zig-out/lib/* "kvdb-${{ github.ref_name }}-${{ matrix.arch }}/" -ErrorAction SilentlyContinue
+          Copy-Item zig-out/bin/kvdb-cli.exe "kvdb-${{ github.ref_name }}-${{ matrix.arch }}/" -ErrorAction SilentlyContinue
+          Copy-Item README.md "kvdb-${{ github.ref_name }}-${{ matrix.arch }}/" -ErrorAction SilentlyContinue
+          Copy-Item LICENSE "kvdb-${{ github.ref_name }}-${{ matrix.arch }}/" -ErrorAction SilentlyContinue
+          Compress-Archive -Path "kvdb-${{ github.ref_name }}-${{ matrix.arch }}" -DestinationPath "kvdb-${{ github.ref_name }}-${{ matrix.arch }}.zip" -Force
         shell: pwsh
 
-      - name: Upload artifacts
+      - name: Package (Latest)
+        if: matrix.os != 'windows-latest'
+        run: |
+          mkdir -p kvdb-latest-${{ matrix.arch }}
+          cp zig-out/lib/* kvdb-latest-${{ matrix.arch }}/ 2>/dev/null || true
+          cp zig-out/bin/kvdb-cli kvdb-latest-${{ matrix.arch }}/ 2>/dev/null || true
+          cp README.md LICENSE kvdb-latest-${{ matrix.arch }}/ 2>/dev/null || true
+          tar czvf kvdb-latest-${{ matrix.arch }}.tar.gz kvdb-latest-${{ matrix.arch }}
+        shell: bash
+
+      - name: Package (Latest Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          New-Item -ItemType Directory -Force -Path "kvdb-latest-${{ matrix.arch }}"
+          Copy-Item zig-out/lib/* "kvdb-latest-${{ matrix.arch }}/" -ErrorAction SilentlyContinue
+          Copy-Item zig-out/bin/kvdb-cli.exe "kvdb-latest-${{ matrix.arch }}/" -ErrorAction SilentlyContinue
+          Copy-Item README.md "kvdb-latest-${{ matrix.arch }}/" -ErrorAction SilentlyContinue
+          Copy-Item LICENSE "kvdb-latest-${{ matrix.arch }}/" -ErrorAction SilentlyContinue
+          Compress-Archive -Path "kvdb-latest-${{ matrix.arch }}" -DestinationPath "kvdb-latest-${{ matrix.arch }}.zip" -Force
+        shell: pwsh
+
+      - name: Upload versioned artifacts
         uses: actions/upload-artifact@v6
         with:
-          name: kvdb-${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}
+          name: kvdb-${{ github.ref_name }}-${{ matrix.arch }}
           path: |
-            kvdb-*.tar.gz
-            kvdb-*.zip
+            kvdb-${{ github.ref_name }}-*.tar.gz
+            kvdb-${{ github.ref_name }}-*.zip
+          retention-days: 7
+
+      - name: Upload latest artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: kvdb-latest-${{ matrix.arch }}
+          path: |
+            kvdb-latest-*.tar.gz
+            kvdb-latest-*.zip
           retention-days: 7
 
   create-release:
@@ -106,57 +122,38 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Determine version
-        id: version
-        shell: bash
-        run: |
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            VERSION="${{ github.ref_name }}"
-            IS_LATEST="false"
-          else
-            VERSION="latest"
-            IS_LATEST="true"
-          fi
-          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
-          echo "IS_LATEST=$IS_LATEST" >> $GITHUB_OUTPUT
-          echo "Version: $VERSION, Is Latest: $IS_LATEST"
-
-      - name: Download all artifacts
+      - name: Download versioned artifacts
         uses: actions/download-artifact@v8
         with:
-          path: artifacts
+          path: artifacts/version
           merge-multiple: true
-          pattern: kvdb-${{ steps.version.outputs.VERSION }}-*
+          pattern: kvdb-${{ github.ref_name }}-*
+
+      - name: Download latest artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts/latest
+          merge-multiple: true
+          pattern: kvdb-latest-*
 
       - name: List artifacts
-        run: ls -la artifacts/
-
-      - name: Delete existing latest release
-        if: steps.version.outputs.IS_LATEST == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          # Delete existing latest tag and release if they exist
-          gh release delete latest --yes 2>/dev/null || true
-          git push --delete origin latest 2>/dev/null || true
-          # Create new latest tag pointing to current commit
-          git tag -fa latest -m "Latest build from main"
-          git push -f origin latest
+          echo "=== Versioned artifacts ==="
+          ls -la artifacts/version/
+          echo "=== Latest artifacts ==="
+          ls -la artifacts/latest/
 
-      - name: Create Release
-        id: create_release
+      - name: Create Versioned Release
         uses: softprops/action-gh-release@v2
         with:
-          name: ${{ steps.version.outputs.IS_LATEST == 'true' && 'Latest' || format('Release {0}', steps.version.outputs.VERSION) }}
-          tag_name: ${{ steps.version.outputs.VERSION }}
+          name: Release ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
           draft: false
-          prerelease: ${{ steps.version.outputs.IS_LATEST == 'true' }}
-          files: artifacts/kvdb-*
-          generate_release_notes: ${{ steps.version.outputs.IS_LATEST != 'true' }}
+          prerelease: false
+          files: artifacts/version/kvdb-${{ github.ref_name }}-*.tar.gz,artifacts/version/kvdb-${{ github.ref_name }}-*.zip
+          generate_release_notes: true
           body: |
-            ## KVDB ${{ steps.version.outputs.VERSION }}
-
-            ${{ steps.version.outputs.IS_LATEST == 'true' && 'This is the latest development build from the main branch. It may contain unstable features.' || '' }}
+            ## KVDB ${{ github.ref_name }}
 
             ### Installation
 
@@ -164,15 +161,15 @@ jobs:
 
             **Linux/macOS:**
             ```bash
-            tar xzvf kvdb-${{ steps.version.outputs.VERSION }}-<arch>.tar.gz
-            cd kvdb-${{ steps.version.outputs.VERSION }}-<arch>
+            tar xzvf kvdb-${{ github.ref_name }}-<arch>.tar.gz
+            cd kvdb-${{ github.ref_name }}-<arch>
             ./kvdb-cli --help
             ```
 
             **Windows:**
             ```powershell
-            Expand-Archive kvdb-${{ steps.version.outputs.VERSION }}-<arch>.zip
-            cd kvdb-${{ steps.version.outputs.VERSION }}-<arch>
+            Expand-Archive kvdb-${{ github.ref_name }}-<arch>.zip
+            cd kvdb-${{ github.ref_name }}-<arch>
             .\kvdb-cli.exe --help
             ```
 
@@ -180,25 +177,39 @@ jobs:
 
             | Platform | Architecture | File |
             |----------|--------------|------|
-            | Linux | x86_64 | `kvdb-${{ steps.version.outputs.VERSION }}-x86_64-linux.tar.gz` |
-            | Linux | ARM64 | `kvdb-${{ steps.version.outputs.VERSION }}-aarch64-linux.tar.gz` |
-            | macOS | x86_64 | `kvdb-${{ steps.version.outputs.VERSION }}-x86_64-macos.tar.gz` |
-            | macOS | Apple Silicon | `kvdb-${{ steps.version.outputs.VERSION }}-aarch64-macos.tar.gz` |
-            | Windows | x86_64 | `kvdb-${{ steps.version.outputs.VERSION }}-x86_64-windows.zip` |
+            | Linux | x86_64 | `kvdb-${{ github.ref_name }}-x86_64-linux.tar.gz` |
+            | Linux | ARM64 | `kvdb-${{ github.ref_name }}-aarch64-linux.tar.gz` |
+            | macOS | x86_64 | `kvdb-${{ github.ref_name }}-x86_64-macos.tar.gz` |
+            | macOS | Apple Silicon | `kvdb-${{ github.ref_name }}-aarch64-macos.tar.gz` |
+            | Windows | x86_64 | `kvdb-${{ github.ref_name }}-x86_64-windows.zip` |
 
             ### Quick Start
 
             ```bash
             # Create a database
             ./kvdb-cli my.db put name "KVDB"
-            ./kvdb-cli my.db put version "${{ steps.version.outputs.VERSION }}"
+            ./kvdb-cli my.db put version "${{ github.ref_name }}"
 
             # Query data
             ./kvdb-cli my.db get name
             ./kvdb-cli my.db list
             ```
 
-            ${{ steps.version.outputs.IS_LATEST == 'true' && '' || format('### Verification
+            ### Verification
 
             All binaries are built automatically from the tagged source code using GitHub Actions.
-            Check the [workflow run](https://github.com/{0}/actions/runs/{1}) for build logs.', github.repository, github.run_id) }}
+            Check the [workflow run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) for build logs.
+
+      - name: Update Latest Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Delete existing latest release if exists
+          gh release delete latest --yes 2>/dev/null || true
+          sleep 2
+          # Create new latest release pointing to this tag
+          gh release create latest \
+            --title "Latest" \
+            --notes "Latest stable release (${{ github.ref_name }}). Download the versioned release for checksums and release notes." \
+            --target ${{ github.sha }} \
+            artifacts/latest/kvdb-latest-*

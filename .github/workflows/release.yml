@@ -1,0 +1,157 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build and Release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-linux-gnu
+            arch: x86_64-linux
+          - os: ubuntu-latest
+            target: aarch64-linux-gnu
+            arch: aarch64-linux
+          - os: macos-latest
+            target: aarch64-macos
+            arch: aarch64-macos
+          - os: macos-latest
+            target: x86_64-macos
+            arch: x86_64-macos
+          - os: windows-latest
+            target: x86_64-windows-gnu
+            arch: x86_64-windows
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: '0.15.2'
+
+      - name: Build library
+        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
+        shell: bash
+
+      - name: Build CLI tool
+        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }} kvdb-cli
+        shell: bash
+
+      - name: Package (Unix)
+        if: matrix.os != 'windows-latest'
+        run: |
+          mkdir -p kvdb-${{ github.ref_name }}-${{ matrix.arch }}
+          cp zig-out/lib/* kvdb-${{ github.ref_name }}-${{ matrix.arch }}/ 2>/dev/null || true
+          cp zig-out/bin/kvdb-cli kvdb-${{ github.ref_name }}-${{ matrix.arch }}/ 2>/dev/null || cp zig-out/bin/kvdb-cli.exe kvdb-${{ github.ref_name }}-${{ matrix.arch }}/ 2>/dev/null || true
+          cp README.md LICENSE kvdb-${{ github.ref_name }}-${{ matrix.arch }}/ 2>/dev/null || true
+          tar czvf kvdb-${{ github.ref_name }}-${{ matrix.arch }}.tar.gz kvdb-${{ github.ref_name }}-${{ matrix.arch }}
+        shell: bash
+
+      - name: Package (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          New-Item -ItemType Directory -Force -Path "kvdb-${{ github.ref_name }}-${{ matrix.arch }}"
+          Copy-Item zig-out/lib/* "kvdb-${{ github.ref_name }}-${{ matrix.arch }}/" -ErrorAction SilentlyContinue
+          Copy-Item zig-out/bin/kvdb-cli.exe "kvdb-${{ github.ref_name }}-${{ matrix.arch }}/" -ErrorAction SilentlyContinue
+          Copy-Item README.md "kvdb-${{ github.ref_name }}-${{ matrix.arch }}/" -ErrorAction SilentlyContinue
+          Copy-Item LICENSE "kvdb-${{ github.ref_name }}-${{ matrix.arch }}/" -ErrorAction SilentlyContinue
+          Compress-Archive -Path "kvdb-${{ github.ref_name }}-${{ matrix.arch }}" -DestinationPath "kvdb-${{ github.ref_name }}-${{ matrix.arch }}.zip" -Force
+        shell: pwsh
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: kvdb-${{ matrix.arch }}
+          path: |
+            kvdb-*.tar.gz
+            kvdb-*.zip
+          retention-days: 7
+
+  create-release:
+    name: Create Release
+    needs: build-and-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la artifacts/
+
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Release ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          files: artifacts/kvdb-*
+          generate_release_notes: true
+          body: |
+            ## KVDB ${{ github.ref_name }}
+
+            ### Installation
+
+            Download the appropriate archive for your platform and extract it:
+
+            **Linux/macOS:**
+            ```bash
+            tar xzvf kvdb-<version>-<arch>.tar.gz
+            cd kvdb-<version>-<arch>
+            ./kvdb-cli --help
+            ```
+
+            **Windows:**
+            ```powershell
+            Expand-Archive kvdb-<version>-<arch>.zip
+            cd kvdb-<version>-<arch>
+            .\kvdb-cli.exe --help
+            ```
+
+            ### Available Builds
+
+            | Platform | Architecture | File |
+            |----------|--------------|------|
+            | Linux | x86_64 | `kvdb-${{ github.ref_name }}-x86_64-linux.tar.gz` |
+            | Linux | ARM64 | `kvdb-${{ github.ref_name }}-aarch64-linux.tar.gz` |
+            | macOS | x86_64 | `kvdb-${{ github.ref_name }}-x86_64-macos.tar.gz` |
+            | macOS | Apple Silicon | `kvdb-${{ github.ref_name }}-aarch64-macos.tar.gz` |
+            | Windows | x86_64 | `kvdb-${{ github.ref_name }}-x86_64-windows.zip` |
+
+            ### Quick Start
+
+            ```bash
+            # Create a database
+            ./kvdb-cli my.db put name "KVDB"
+            ./kvdb-cli my.db put version "${{ github.ref_name }}"
+
+            # Query data
+            ./kvdb-cli my.db get name
+            ./kvdb-cli my.db list
+            ```
+
+            ### Verification
+
+            All binaries are built automatically from the tagged source code using GitHub Actions.
+            Check the [workflow run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) for build logs.

@@ -1,0 +1,55 @@
+#!/bin/sh
+# Pre-commit hook for KVDB project
+# Automatically runs format check, build, and tests before allowing commits
+
+set -e
+
+echo "========================================"
+echo "Running pre-commit checks..."
+echo "========================================"
+
+# Check if zig is available
+if ! command -v zig >/dev/null 2>&1; then
+    echo "Error: zig not found in PATH"
+    exit 1
+fi
+
+echo ""
+echo "1. Checking code formatting..."
+echo "----------------------------------------"
+# Check formatting without modifying files
+zig fmt --check src/ examples/ || {
+    echo ""
+    echo "Error: Code formatting issues detected!"
+    echo "Run 'zig fmt src/ examples/' to fix formatting."
+    exit 1
+}
+echo "   Formatting check passed!"
+
+echo ""
+echo "2. Building project..."
+echo "----------------------------------------"
+zig build || {
+    echo ""
+    echo "Error: Build failed!"
+    exit 1
+}
+echo "   Build passed!"
+
+echo ""
+echo "3. Running tests..."
+echo "----------------------------------------"
+zig build test || {
+    echo ""
+    echo "Error: Tests failed!"
+    exit 1
+}
+echo "   Tests passed!"
+
+echo ""
+echo "========================================"
+echo "All pre-commit checks passed!"
+echo "Proceeding with commit..."
+echo "========================================"
+
+exit 0

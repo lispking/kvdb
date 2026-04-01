@@ -1,0 +1,11 @@
+.{
+    .name = .kvdb,
+    .version = "0.1.0",
+    .fingerprint = 0x3f32152b729dc036,
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

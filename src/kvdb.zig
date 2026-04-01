@@ -481,11 +481,11 @@ pub fn open(allocator: std.mem.Allocator, path: []const u8) !Database {
 
 test "Database basic operations" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/test_kvdb.db";
+    const test_path = "test_kvdb.db";
 
     // Cleanup after test
     defer std.fs.cwd().deleteFile(test_path) catch {};
-    defer std.fs.cwd().deleteFile("/tmp/test_kvdb.db.wal") catch {};
+    defer std.fs.cwd().deleteFile("test_kvdb.db.wal") catch {};
 
     // Test 1: Create and manipulate database
     {
@@ -532,11 +532,11 @@ test "Database basic operations" {
 
 test "Database transaction" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/test_kvdb_txn.db";
+    const test_path = "test_txn.db";
 
     // Cleanup after test
     defer std.fs.cwd().deleteFile(test_path) catch {};
-    defer std.fs.cwd().deleteFile("/tmp/test_kvdb_txn.db.wal") catch {};
+    defer std.fs.cwd().deleteFile("test_txn.db.wal") catch {};
 
     var db = try Database.open(allocator, test_path, .{});
     defer db.close();

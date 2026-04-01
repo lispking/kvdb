@@ -340,7 +340,7 @@ test "Pager basic operations" {
     const allocator = std.testing.allocator;
 
     // Use a temporary file for testing
-    const test_path = "/tmp/test_kvdb_pager.db";
+    const test_path = "test_pager.db";
     defer std.fs.cwd().deleteFile(test_path) catch {};
 
     // Test 1: Create new database

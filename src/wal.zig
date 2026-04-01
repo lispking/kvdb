@@ -339,8 +339,8 @@ pub const Wal = struct {
 
 test "WAL basic operations" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/test_kvdb_wal";
-    const wal_path = "/tmp/test_kvdb_wal.wal";
+    const test_path = "test_wal";
+    const wal_path = "test_wal.wal";
 
     // Cleanup any existing test files
     defer {

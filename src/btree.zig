@@ -513,7 +513,7 @@ pub const BTree = struct {
 
 test "BTree basic operations" {
     const allocator = std.testing.allocator;
-    const test_path = "/tmp/test_kvdb_btree.db";
+    const test_path = "test_btree.db";
     defer std.fs.cwd().deleteFile(test_path) catch {};
 
     var p = try Pager.init(allocator, test_path);

@@ -1,14 +1,27 @@
 const std = @import("std");
 const kvdb = @import("kvdb");
+const config = @import("config");
 
 const Database = kvdb.Database;
+
+/// Print version information.
+fn printVersion() void {
+    std.debug.print("kvdb-cli version {s} (git: {s})\n", .{
+        config.version,
+        config.git_commit,
+    });
+}
 
 /// Print usage information for the CLI tool.
 ///
 /// Displays available commands and their syntax.
 fn printUsage() void {
     std.debug.print(
-        \\Usage: kvdb-cli <database-file> <command> [args...]
+        \\Usage: kvdb-cli [options] <database-file> <command> [args...]
+        \\
+        \\Options:
+        \\  -h, --help       Show this help message
+        \\  -v, --version    Show version information
         \\
         \\Commands:
         \\  get <key>              Get value by key
@@ -35,6 +48,23 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     // Validate argument count
+    if (args.len < 2) {
+        printUsage();
+        return;
+    }
+
+    // Check for global options (--version, --help) before database path
+    const first_arg = args[1];
+    if (std.mem.eql(u8, first_arg, "--version") or std.mem.eql(u8, first_arg, "-v")) {
+        printVersion();
+        return;
+    }
+    if (std.mem.eql(u8, first_arg, "--help") or std.mem.eql(u8, first_arg, "-h")) {
+        printUsage();
+        return;
+    }
+
+    // Now we need at least 3 args: program, db_path, command
     if (args.len < 3) {
         printUsage();
         return;

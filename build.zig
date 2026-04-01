@@ -1,8 +1,37 @@
 const std = @import("std");
 
+/// Read version from build.zig.zon
+fn readVersion() []const u8 {
+    const zon = @import("build.zig.zon");
+    return zon.version;
+}
+
+/// Get git commit id (short format)
+fn getGitCommit(b: *std.Build) []const u8 {
+    const result = std.process.Child.run(.{
+        .allocator = b.allocator,
+        .argv = &.{ "git", "rev-parse", "--short", "HEAD" },
+    }) catch return "unknown";
+
+    if (result.term.Exited != 0) return "unknown";
+
+    // Remove trailing newline
+    const commit = result.stdout;
+    if (commit.len > 0 and commit[commit.len - 1] == '\n') {
+        return commit[0 .. commit.len - 1];
+    }
+    return commit;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    // Read version from build.zig.zon
+    const version = readVersion();
+
+    // Get git commit id
+    const git_commit = getGitCommit(b);
 
     // Library module
     const kvdb_mod = b.createModule(.{
@@ -18,6 +47,11 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(lib);
 
+    // Create options module for version info
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", version);
+    options.addOption([]const u8, "git_commit", git_commit);
+
     // CLI executable
     const exe = b.addExecutable(.{
         .name = "kvdb-cli",
@@ -28,6 +62,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("kvdb", kvdb_mod);
+    exe.root_module.addOptions("config", options);
     b.installArtifact(exe);
 
     // Tests

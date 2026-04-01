@@ -47,12 +47,8 @@ jobs:
         with:
           version: '0.15.2'
 
-      - name: Build library
+      - name: Build
         run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
-        shell: bash
-
-      - name: Build CLI tool
-        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }} kvdb-cli
         shell: bash
 
       - name: Package (Unix)

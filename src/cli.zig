@@ -103,6 +103,14 @@ pub fn main() !void {
             stats.db_size,
             @as(f64, @floatFromInt(stats.db_size)) / (1024 * 1024),
         });
+    } else if (std.mem.eql(u8, command, "compact")) {
+        // Handle: compact (compact the database)
+        const new_stats = try db.compact();
+        std.debug.print("Compacted database successfully.\n", .{});
+        std.debug.print("New size: {d} pages ({d:.2} MB)\n", .{
+            new_stats.page_count,
+            @as(f64, @floatFromInt(new_stats.db_size)) / (1024 * 1024),
+        });
     } else {
         // Unknown command
         std.debug.print("Unknown command: {s}\n", .{command});

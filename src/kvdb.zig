@@ -368,6 +368,61 @@ pub const Database = struct {
         db_size: u64,
     };
 
+    /// Compact the database by removing deleted entries.
+    ///
+    /// This operation creates a new database file with only the valid
+    /// key-value pairs, then atomically replaces the original file.
+    /// The WAL is cleared after successful compaction.
+    ///
+    /// Returns: New database statistics after compaction
+    /// Errors: Returns any filesystem or database error
+    pub fn compact(self: *Database) !Stats {
+        // Cannot compact during an active transaction
+        if (self.transaction != null) {
+            return Error.TransactionAlreadyActive;
+        }
+
+        // Save the database path (close() will free it)
+        const db_path = try self.allocator.dupe(u8, self.db_path);
+        defer self.allocator.free(db_path);
+
+        // Save options for reopening
+        const options = self.options;
+
+        // Create temporary file path
+        const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{db_path});
+        defer self.allocator.free(tmp_path);
+
+        // Create new database with WAL disabled (we'll clean it at the end)
+        var new_db = try Database.open(self.allocator, tmp_path, .{
+            .enable_wal = false,
+        });
+        errdefer new_db.close();
+
+        // Copy all key-value pairs to new database
+        var iter = try self.iterator();
+        while (iter.next()) |entry| {
+            try new_db.put(entry.key, entry.value);
+        }
+
+        // Close both databases to release file handles
+        new_db.close();
+        self.close();
+
+        // Atomically replace original file with compacted version
+        try std.fs.cwd().rename(tmp_path, db_path);
+
+        // Delete the old WAL file if it exists
+        const wal_path = try std.fmt.allocPrint(self.allocator, "{s}.wal", .{db_path});
+        defer self.allocator.free(wal_path);
+        std.fs.cwd().deleteFile(wal_path) catch {};
+
+        // Reopen the compacted database
+        self.* = try Database.open(self.allocator, db_path, options);
+
+        return self.stats();
+    }
+
     /// C-compatible API for FFI (Foreign Function Interface).
     ///
     /// These functions allow the database to be used from other languages

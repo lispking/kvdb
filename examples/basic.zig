@@ -48,6 +48,8 @@ pub fn main() !void {
     for (keys) |key| {
         const value = try db.get(key);
         if (value) |v| {
+            // db.get() returns an owned copy, so each successful lookup result
+            // must be freed by the caller after printing or otherwise consuming it.
             defer allocator.free(v);
             std.debug.print("  {s} = {s}\n", .{ key, v });
         }
@@ -80,9 +82,11 @@ pub fn main() !void {
     // Iterate All Entries
     // ====================================================================
     std.debug.print("\nIterating all entries:\n", .{});
+    // The iterator now walks every reachable leaf page in sorted order, so the
+    // example should use `try` when advancing through the fallible iterator.
     var iter = try db.iterator();
     var count: usize = 0;
-    while (iter.next()) |entry| {
+    while (try iter.next()) |entry| {
         std.debug.print("  {s} = {s}\n", .{ entry.key, entry.value });
         count += 1;
     }

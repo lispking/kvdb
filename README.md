@@ -5,10 +5,11 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Zig Version](https://img.shields.io/badge/Zig-0.15.2-orange.svg)](https://ziglang.org)
 
-A lightweight, high-performance embedded key-value database written in Zig, featuring B-tree indexing, Write-Ahead Logging (WAL) for durability, and ACID transactions.
+An experimental embedded key-value database written in Zig, built around page-based storage, sorted leaf-page indexing, WAL record logging, and a small transaction API.
 
 ## Table of Contents
 
+- [Project Status](#project-status)
 - [Features](#features)
 - [Architecture](#architecture)
 - [Download](#download)
@@ -21,31 +22,51 @@ A lightweight, high-performance embedded key-value database written in Zig, feat
 - [Performance Considerations](#performance-considerations)
 - [License](#license)
 
+## Project Status
+
+KVDB is currently best viewed as an early-stage embedded storage engine.
+
+What works today:
+
+- persistent page-based storage with CRUD operations
+- multi-page B-tree insert/search/iteration support
+- WAL record writing with CRC32 checksums
+- explicit transaction APIs plus compaction and CLI tooling
+- basic automated tests and CI
+
+Important current limitations:
+
+- multi-page deletes work only while each touched non-root leaf keeps at least one entry; borrow/merge/root-shrink are not implemented yet
+- automatic startup recovery replays committed WAL records during `Database.open`
+- rollback is implemented by reloading the database file, not by targeted undo
+- compression is not implemented
+
 ## Features
 
-### Core Features
+### Implemented Today
 
-- **B-Tree Indexing**: Efficient O(log n) lookups, insertions, and deletions with balanced tree structure
-- **ACID Transactions**: Full atomicity, consistency, isolation, and durability support
-- **Write-Ahead Logging (WAL)**: Crash recovery through durable transaction logs with CRC32 checksums
-- **Page-Based Storage**: 4KB fixed-size pages optimized for file system alignment
-- **In-Memory Page Cache**: Reduces disk I/O through intelligent caching
+- **Page-Based Storage**: 4KB fixed-size pages optimized for simple file I/O
+- **Sorted Leaf-Page Indexing**: Keys are kept sorted inside the current root leaf page and searched with binary search
+- **Basic Transaction API**: One active transaction per database with explicit `commit()` / `abort()` methods
+- **WAL Record Logging**: Insert/delete/commit/abort records include CRC32 checksums
+- **In-Memory Page Cache**: Reduces repeated disk reads for loaded pages
+- **Database Compaction**: Rebuilds the database into a fresh file, validates logical contents, then atomically replaces the original
 - **Zero External Dependencies**: Pure Zig implementation with no external libraries required
 
-### Data Capabilities
+### Data Limits
 
 - **Arbitrary Binary Data**: Store any byte sequence as keys and values
 - **Maximum Key Size**: 1KB per key
 - **Maximum Value Size**: 2KB per value (half page size)
-- **Large Database Support**: 64-bit page addressing supports exabyte-scale storage
-- **Iteration Support**: Traverse all key-value pairs in sorted order
+- **64-bit Page Identifiers**: On-disk structures use 64-bit page IDs
 
-### Safety and Reliability
+### Current Constraints
 
-- **CRC32 Checksums**: Detect data corruption in WAL records
-- **Magic Number Verification**: Prevent accidental opening of non-database files
-- **Automatic Crash Recovery**: Replay WAL on startup to recover uncommitted transactions
-- **Comprehensive Error Handling**: Detailed error types for all failure modes
+- **Multi-Page Inserts**: Root and internal-node split propagation now allow the tree to grow beyond one page
+- **Multi-Page Deletes**: Deletes work while each touched non-root leaf keeps at least one entry; deletes that would require borrow/merge/root-shrink currently return `NodeEmpty`
+- **Leaf Update Repacking**: Repeated overwrites now repack the target leaf so updates do not keep leaking dead payload bytes
+- **Recovery Wiring**: `Database.open` replays committed WAL records and clears the WAL after successful recovery
+- **Simplified Rollback**: `abort()` reloads the database instead of doing targeted undo
 
 ## Architecture
 
@@ -59,18 +80,22 @@ A lightweight, high-performance embedded key-value database written in Zig, feat
 |  - Magic number     |  - Node headers              |
 |  - Version          |  - Key/value data            |
 |  - Root page ID     |  - Child page references     |
-|  - Free list        |                              |
+|  - Reserved fields  |                              |
 +---------------------------------------------------+
 ```
 
+The metadata format now tracks both the freelist head and the highest page ID grown from the file, so freed pages can be reused before the database extends on disk.
+
 ### B-Tree Structure
 
-The database uses a B-tree index for efficient key-value storage:
+The on-disk page format is now wired for multi-page growth during insert, while delete remains intentionally staged until rebalancing lands.
 
-- **Node Types**: Leaf nodes store data; internal nodes store keys and child pointers
-- **Node Capacity**: Up to 64 key-value pairs per node
-- **Sorted Keys**: Keys maintained in sorted order for binary search
-- **Space Management**: Key/value data grows upward from end of page
+- **Leaf Nodes**: Store key-value pairs directly
+- **Internal Nodes**: Multi-page insert/search/iteration now route through separator keys and child pointers
+- **Current Root Capacity**: The original root still starts as a leaf page, then promotes in place to an internal root on overflow
+- **Sorted Keys**: Keys are maintained in sorted order for binary search inside each node
+- **Space Management**: Key/value data grows upward from the end of the page
+- **Delete Limitation**: Deletes that would empty a non-root leaf are rejected with `NodeEmpty` until borrow/merge/root-shrink support is implemented
 
 Each B-tree node layout:
 ```
@@ -81,7 +106,7 @@ Each B-tree node layout:
 
 ### Write-Ahead Log (WAL)
 
-The WAL ensures durability and crash recovery:
+The WAL currently records write operations and stores enough information for validation and future recovery work:
 
 ```
 [WAL Record Header (11 bytes)]
@@ -99,7 +124,7 @@ The WAL ensures durability and crash recovery:
 - `commit`: Mark transaction as committed
 - `abort`: Mark transaction as rolled back
 
-On startup, if uncommitted WAL records exist, they are replayed to restore database state.
+Automatic startup recovery now replays committed WAL records during `Database.open`; uncommitted and aborted WAL entries are discarded. A truncated tail header is ignored as an incomplete final record, while checksum mismatches and partial record payloads fail recovery.
 
 ### Page Cache
 
@@ -214,9 +239,7 @@ defer db.close();
 
 // Open with custom options
 var db = try Database.open(allocator, "path/to/db", .{
-    .page_size = 4096,        // Page size (default: 4096)
-    .enable_wal = true,       // Enable WAL (default: true)
-    .enable_compression = false,  // Compression (not yet implemented)
+    .enable_wal = true,
 });
 ```
 
@@ -239,6 +262,12 @@ const exists = try db.contains("key");
 try db.delete("key");
 ```
 
+**Current Write Behavior:**
+- `put()` and `delete()` do not require `beginTransaction()`
+- writes update the current database handle immediately in memory
+- durability happens later when dirty pages are flushed, such as during `commit()` or `close()`
+- reads through the same handle observe the updated in-memory state immediately
+
 ### Transactions
 
 ```zig
@@ -258,11 +287,18 @@ try {
 }
 ```
 
-**Transaction Rules:**
-- Only one active transaction at a time per database
-- Changes are invisible until commit
-- WAL records are cleared after successful commit
-- Abort reloads database to pre-transaction state
+**Current Transaction Semantics:**
+- Only one active transaction at a time per database handle
+- `beginTransaction()` does not create snapshots or isolation; it only establishes an explicit commit/abort boundary for the current handle
+- `put()` and `delete()` still modify the current handle's in-memory pages immediately
+- `commit()` appends a commit marker, flushes the handle's dirty pages, and clears the WAL
+- `abort()` appends an abort marker, clears the WAL, and reloads the database file, discarding the handle's unflushed in-memory changes
+- startup recovery treats WAL records as logical batches: `insert` / `delete` records stay pending until `commit`, `abort` discards the pending batch, and trailing incomplete batches are ignored
+- automatic startup recovery replays committed WAL records during `Database.open`
+- a truncated final WAL header is treated as an incomplete tail, while checksum mismatches and partial record payloads fail recovery
+- multi-page deletes succeed only when no touched non-root leaf becomes empty; deletes that would require borrow/merge/root-shrink currently fail with `NodeEmpty`
+
+**Recommendation:** For predictable behavior in the current engine, group related writes inside an explicit transaction and avoid mixing earlier unflushed writes with a later `abort()`.
 
 ### Iteration
 
@@ -276,7 +312,7 @@ while (iter.next()) |entry| {
 }
 ```
 
-**Note:** Current implementation supports single-page iteration only.
+**Note:** Current implementation iterates in sorted order across all reachable leaf pages.
 
 ### Statistics
 
@@ -306,6 +342,11 @@ kvdb-cli <database-file> <command> [args...]
 | `delete <key>` | Delete a key | `kvdb-cli my.db delete name` |
 | `list` | List all entries | `kvdb-cli my.db list` |
 | `stats` | Show database statistics | `kvdb-cli my.db stats` |
+| `inspect` | Show metadata and structural tree summary | `kvdb-cli my.db inspect` |
+| `export <file>` | Stream all logical entries into a portable binary dump | `kvdb-cli my.db export backup.kvdbx` |
+| `import <file>` | Load entries from a portable binary dump in one transaction | `kvdb-cli my.db import backup.kvdbx` |
+| `compact` | Rewrite live data into a compacted database file | `kvdb-cli my.db compact` |
+| `verify` | Validate metadata, tree ordering, freelist, and WAL records | `kvdb-cli my.db verify` |
 
 ### Examples
 
@@ -333,6 +374,44 @@ kvdb-cli my.db stats
 #   Pages: 2
 #   Page Size: 4096 bytes
 #   Database Size: 8192 bytes (0.01 MB)
+
+# Verify on-disk structure
+kvdb-cli my.db verify
+# Output:
+# Verification OK
+#   Tree pages checked: 1
+#   Entries checked: 2
+#   WAL records checked: 0
+
+# Inspect metadata and tree shape
+kvdb-cli my.db inspect
+# Output:
+# Database
+#   Pages: 2
+#   Page Size: 4096 bytes
+#   Database Size: 8192 bytes (0.01 MB)
+# Metadata
+#   Root Page ID: 1
+#   Freelist Head: 18446744073709551615
+#   Freelist Pages: 0
+#   Last Page ID: 1
+#   WAL Offset: 0
+# B-Tree
+#   Height: 1
+#   Nodes: 1
+#   Leaf Nodes: 1
+#   Internal Nodes: 0
+#   Entries: 2
+
+# Export logical contents to a binary-safe dump file
+kvdb-cli my.db export backup.kvdbx
+# Output:
+# Exported 2 entries
+
+# Import the dump into a fresh database
+kvdb-cli restored.db import backup.kvdbx
+# Output:
+# Imported 2 entries
 ```
 
 ## Building and Testing
@@ -359,6 +438,84 @@ zig build test
 # Run with verbose output
 zig test src/kvdb.zig
 ```
+
+### Benchmark Suite
+
+```bash
+# Run the benchmark suite
+zig build bench
+
+# Build the benchmark binary without running it
+zig build
+./zig-out/bin/benchmark
+```
+
+The current benchmark binary reports these deterministic workloads:
+- sequential inserts
+- random inserts
+- point lookups
+- scans
+- updates
+- deletes
+- compaction
+
+Each run uses fixed operation counts and a fixed PRNG seed so results are comparable across changes.
+
+### FFI Example
+
+A minimal C example lives at `examples/c_api_example.c` and uses the exported C API directly.
+A minimal Python `ctypes` example lives at `examples/python_ctypes_example.py`.
+
+```bash
+# Build the static library
+zig build
+
+# Compile the C example against the installed archive
+zig cc examples/c_api_example.c zig-out/lib/libkvdb.a -o c_api_example
+
+# Run it
+./c_api_example
+
+# Run the Python ctypes example
+python3 examples/python_ctypes_example.py
+```
+
+The example calls `kvdb_open`, `kvdb_put`, `kvdb_get`, `kvdb_free`, `kvdb_close`, and `kvdb_status_code`.
+When `kvdb_get` returns a non-null pointer, the caller owns that buffer and must
+release it with `kvdb_free`.
+
+Mutating C API calls return stable numeric status codes instead of a generic `-1`:
+- `KVDB_STATUS_OK` = 0
+- `KVDB_STATUS_INVALID_ARGUMENT` = 1
+- `KVDB_STATUS_NOT_FOUND` = 2
+- `KVDB_STATUS_TRANSACTION_CONFLICT` = 3
+- `KVDB_STATUS_STORAGE_ERROR` = 4
+- `KVDB_STATUS_WAL_ERROR` = 5
+- `KVDB_STATUS_INTERNAL_ERROR` = 255
+
+Use `kvdb_status_code(...)` from C to compare against the exported enum values without hard-coding numbers in callers.
+
+### Storage Test Matrix
+
+| Area | Core invariants | Current coverage | Missing high-risk coverage |
+|------|------------------|------------------|----------------------------|
+| `constants.zig` | Metadata layout stays stable and fits within one page | `constants: metadata layout` | Format-compatibility checks beyond struct size |
+| `pager.zig` | Page allocation, freelist reuse, and persisted page count survive reopen | `pager: basic operations` | Dirty-page edge cases, invalid page handling, deeper reclaim integration |
+| `btree.zig` | Root leaf inserts, lookups, deletes, and sorted order remain correct | `btree: basic operations` | Duplicate update/delete flows, `NodeFull`, key/value size boundaries, multi-page search |
+| `wal.zig` | WAL records append and decode correctly with record-type boundaries | `wal: basic operations`, `wal: checksum mismatch is corruption`, `wal: truncated value payload is corruption` | Invalid record type handling, broader replay-path coverage |
+| `kvdb.zig` | End-to-end CRUD, reopen persistence, compaction validation, and explicit commit path stay correct | `kvdb: basic operations`, `kvdb: transaction commit`, `kvdb: replay committed wal on open`, `kvdb: ignore uncommitted wal on open`, `kvdb: ignore aborted wal on open`, `kvdb: replay delete on open`, `kvdb: replay mixed wal batches on open`, `kvdb: replay is idempotent across reopen`, `kvdb: ignore truncated wal tail on open`, `kvdb: checksum corruption fails recovery on open`, `kvdb: compact preserves live key-value pairs` | Abort reload behavior, broader compaction correctness, WAL-disabled mode |
+
+### Storage Test Checklist
+
+Use this checklist when changing storage code:
+
+- verify restart persistence for any path that changes on-disk state
+- cover duplicate insert/update/delete flows when touching write logic
+- cover key/value boundary sizes and invalid arguments when touching validation
+- cover `NodeFull` behavior when touching B-tree insertion or page layout
+- cover checksum failure and truncated-tail handling when touching WAL parsing or recovery
+- compare live data before/after compaction or reopen when touching file replacement, freelist reuse, or reload paths
+- name tests with a subsystem prefix such as `test "kvdb: ..."` or `test "wal: ..."`
 
 ### Development Setup
 
@@ -449,18 +606,12 @@ kvdb/
 
 ```zig
 pub const Options = struct {
-    /// Size of each database page (default: 4096)
-    page_size: usize = 4096,
-
-    /// Enable Write-Ahead Logging (default: true)
-    /// Disabling WAL improves performance but loses durability guarantees
+    /// Enable Write-Ahead Logging record writing and startup recovery.
     enable_wal: bool = true,
-
-    /// Enable compression (default: false)
-    /// Not yet implemented
-    enable_compression: bool = false,
 };
 ```
+
+**Note:** WAL controls both record logging and startup recovery replay.
 
 ### Constants
 
@@ -479,12 +630,15 @@ pub const Options = struct {
 
 1. **Batch Operations**: Group multiple puts in a single transaction
 2. **Reuse Connections**: Keep database open for multiple operations
-3. **Appropriate Sizing**: Use default page size (4KB) for most workloads
-4. **Disable WAL**: For non-critical data, disable WAL for better performance
+3. **Page Size**: The current engine uses fixed 4KB pages internally
+4. **Disable WAL**: Only disable WAL if you intentionally want to skip WAL record logging
 
 ### Known Limitations
 
-- Single-page B-tree iteration only
+- Inserts and deletes currently operate on a single root leaf page
+- Iteration is limited to the current root page
+- Automatic WAL replay runs during `Database.open`
+- Rollback is implemented via full reload, not targeted undo
 - No compression support yet
 - No encryption support
 - Single-writer model (no concurrent transactions)

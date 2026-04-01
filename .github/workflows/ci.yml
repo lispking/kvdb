@@ -2,19 +2,18 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, develop]
   pull_request:
-    branches: [main, master]
+    branches: [main, develop]
 
 jobs:
   build-and-test:
-    name: Build and Test
+    name: Build and Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        zig-version: ['0.15.2']
 
     steps:
       - name: Checkout repository
@@ -29,7 +28,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: ${{ matrix.zig-version }}
+          version: 0.15.2
 
       - name: Check formatting
         run: zig fmt --check src/ examples/
@@ -41,6 +40,10 @@ jobs:
 
       - name: Run tests
         run: zig build test
+        shell: bash
+
+      - name: Run benchmark smoke test
+        run: zig build bench
         shell: bash
 
       - name: Build in release mode
@@ -58,20 +61,23 @@ jobs:
         run: |
           git config --global core.autocrlf false
           git config --global core.eol lf
+        shell: bash
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: ${{ matrix.zig-version }}
+          version: 0.15.2
 
       - name: Check formatting
         run: zig fmt --check src/ examples/
+        shell: bash
 
       - name: Build with strict settings
         run: zig build -Dtarget=native-native-gnu
+        shell: bash
 
-  coverage:
-    name: Code Coverage
+  recovery-tests:
+    name: Recovery Coverage
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -81,22 +87,13 @@ jobs:
         run: |
           git config --global core.autocrlf false
           git config --global core.eol lf
+        shell: bash
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: ${{ matrix.zig-version }}
+          version: 0.15.2
 
-      - name: Run tests with coverage
-        run: |
-          zig test src/kvdb.zig -femit-bin=/dev/null -ODebug --test-runner \.\zig-cache 2>&1 | tee test_output.txt
+      - name: Run recovery-focused tests
+        run: zig build test
         shell: bash
-        continue-on-error: true
-
-      - name: Upload coverage report
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: test-output
-          path: test_output.txt
-          retention-days: 7

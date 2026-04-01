@@ -167,15 +167,16 @@ pub const Wal = struct {
 
     /// Log a transaction commit.
     ///
-    /// Marks that all operations in the current transaction have been
-    /// successfully applied to the database.
+    /// Writes a commit boundary record to the WAL. The caller is responsible
+    /// for coordinating this marker with page flushing and WAL clearing.
     pub fn logCommit(self: *Wal) !void {
         try self.appendRecord(.commit, &.{}, null);
     }
 
     /// Log a transaction abort/rollback.
     ///
-    /// Marks that the current transaction should be discarded.
+    /// Writes an abort boundary record to the WAL. The caller is responsible
+    /// for deciding how in-memory state is discarded or restored.
     pub fn logAbort(self: *Wal) !void {
         try self.appendRecord(.abort, &.{}, null);
     }
@@ -215,29 +216,34 @@ pub const Wal = struct {
             const header_bytes = std.mem.asBytes(&header);
             const header_read = try self.wal.file.read(header_bytes);
             if (header_read < header_bytes.len) {
+                // A short header read at EOF is treated as an incomplete tail.
+                // Higher-level recovery policy decides whether that is ignored
+                // or surfaced as an error for the current workload.
                 return null; // Incomplete record
             }
 
             // Read key
             const key = try self.wal.allocator.alloc(u8, header.key_len);
-            errdefer self.wal.allocator.free(key);
+            var value: ?[]u8 = null;
+            var owns_record_buffers = true;
+            defer {
+                if (owns_record_buffers) {
+                    self.wal.allocator.free(key);
+                    if (value) |v| self.wal.allocator.free(v);
+                }
+            }
 
             const key_read = try self.wal.file.read(key);
             if (key_read < header.key_len) {
-                self.wal.allocator.free(key);
                 return Error.WalCorrupted;
             }
 
             // Read value (if present)
-            var value: ?[]u8 = null;
             if (header.value_len > 0) {
                 value = try self.wal.allocator.alloc(u8, header.value_len);
-                errdefer if (value) |v| self.wal.allocator.free(v);
 
                 const value_read = try self.wal.file.read(value.?);
                 if (value_read < header.value_len) {
-                    self.wal.allocator.free(key);
-                    if (value) |v| self.wal.allocator.free(v);
                     return Error.WalCorrupted;
                 }
             }
@@ -255,13 +261,12 @@ pub const Wal = struct {
 
             const computed_checksum = crc32(checksum_data.items);
             if (computed_checksum != header.checksum) {
-                self.wal.allocator.free(key);
-                if (value) |v| self.wal.allocator.free(v);
                 return Error.WalCorrupted;
             }
 
             // Advance offset for next read
             self.offset += @sizeOf(WalRecordHeader) + header.key_len + header.value_len;
+            owns_record_buffers = false;
 
             return Record{
                 .record_type = header.record_type,
@@ -284,8 +289,9 @@ pub const Wal = struct {
     /// Replay WAL records for crash recovery.
     ///
     /// Iterates through all records and calls the appropriate callback
-    /// for each operation type. Used during database startup to recover
-    /// uncommitted transactions.
+    /// for each operation type. Recovery policy is decided by the caller,
+    /// which can buffer operations until `commit`, discard them on `abort`,
+    /// or fail fast on corruption.
     ///
     /// Type Parameters:
     ///   - Callback: Struct with onInsert, onDelete, onCommit, onAbort methods
@@ -337,18 +343,19 @@ pub const Wal = struct {
 // Tests
 // =============================================================================
 
-test "WAL basic operations" {
+test "wal: basic operations" {
     const allocator = std.testing.allocator;
     const test_path = "test_wal";
     const wal_path = "test_wal.wal";
 
-    // Cleanup any existing test files
+    // Remove both the synthetic DB path and the WAL file so the test always
+    // starts from an empty log.
     defer {
         std.fs.cwd().deleteFile(test_path) catch {};
         std.fs.cwd().deleteFile(wal_path) catch {};
     }
 
-    // Test 1: Write records to WAL
+    // First pass appends a small transaction-shaped sequence to disk.
     {
         var wal = try Wal.init(allocator, test_path);
         defer wal.deinit();
@@ -359,14 +366,14 @@ test "WAL basic operations" {
         try wal.logCommit();
     }
 
-    // Test 2: Read back and verify records
+    // Second pass reopens the same WAL and verifies ordered decoding.
     {
         var wal = try Wal.init(allocator, test_path);
         defer wal.deinit();
 
         var iter = wal.iterator();
 
-        // Record 1: Insert key1=value1
+        // The first record should be the original insert payload.
         const record1 = (try iter.next()).?;
         try std.testing.expectEqual(WalRecordType.insert, record1.record_type);
         try std.testing.expectEqualStrings("key1", record1.key);
@@ -376,7 +383,7 @@ test "WAL basic operations" {
             allocator.free(record1.value.?);
         }
 
-        // Record 2: Insert key2=value2
+        // The second record should preserve the next insert exactly.
         const record2 = (try iter.next()).?;
         try std.testing.expectEqual(WalRecordType.insert, record2.record_type);
         try std.testing.expectEqualStrings("key2", record2.key);
@@ -386,16 +393,90 @@ test "WAL basic operations" {
             allocator.free(record2.value.?);
         }
 
-        // Record 3: Delete key1
+        // Deletes carry only the key and no value payload.
         const record3 = (try iter.next()).?;
         try std.testing.expectEqual(WalRecordType.delete, record3.record_type);
         try std.testing.expectEqualStrings("key1", record3.key);
         try std.testing.expect(record3.value == null);
         defer allocator.free(record3.key);
 
-        // Record 4: Commit
+        // The trailing boundary record marks the committed batch.
         const record4 = (try iter.next()).?;
         try std.testing.expectEqual(WalRecordType.commit, record4.record_type);
         defer allocator.free(record4.key);
+    }
+}
+
+test "wal: checksum mismatch is corruption" {
+    const allocator = std.testing.allocator;
+    const test_path = "test_wal_checksum";
+    const wal_path = "test_wal_checksum.wal";
+
+    // Clean up the synthetic DB path and WAL file used by this corruption test.
+    defer {
+        std.fs.cwd().deleteFile(test_path) catch {};
+        std.fs.cwd().deleteFile(wal_path) catch {};
+    }
+
+    // Write one valid record so the corruption step mutates a realistic header.
+    {
+        var wal = try Wal.init(allocator, test_path);
+        defer wal.deinit();
+
+        try wal.logInsert("key", "value");
+    }
+
+    // Clobber the stored checksum so iterator validation must reject the record.
+    {
+        var file = try std.fs.cwd().openFile(wal_path, .{ .mode = .read_write });
+        defer file.close();
+
+        try file.seekTo(0);
+        try file.writeAll(&[_]u8{ 0xFF, 0xFF, 0xFF, 0xFF });
+    }
+
+    {
+        var wal = try Wal.init(allocator, test_path);
+        defer wal.deinit();
+
+        var iter = wal.iterator();
+        try std.testing.expectError(Error.WalCorrupted, iter.next());
+    }
+}
+
+test "wal: truncated value payload is corruption" {
+    const allocator = std.testing.allocator;
+    const test_path = "test_wal_truncated_value";
+    const wal_path = "test_wal_truncated_value.wal";
+
+    // Clean up the synthetic DB path and WAL file used by this truncation test.
+    defer {
+        std.fs.cwd().deleteFile(test_path) catch {};
+        std.fs.cwd().deleteFile(wal_path) catch {};
+    }
+
+    // Write a complete insert record before truncating bytes from its value body.
+    {
+        var wal = try Wal.init(allocator, test_path);
+        defer wal.deinit();
+
+        try wal.logInsert("key", "value");
+    }
+
+    // Remove a few bytes from the tail so the iterator sees a short value read.
+    {
+        var file = try std.fs.cwd().openFile(wal_path, .{ .mode = .read_write });
+        defer file.close();
+
+        const stat = try file.stat();
+        try file.setEndPos(stat.size - 2);
+    }
+
+    {
+        var wal = try Wal.init(allocator, test_path);
+        defer wal.deinit();
+
+        var iter = wal.iterator();
+        try std.testing.expectError(Error.WalCorrupted, iter.next());
     }
 }

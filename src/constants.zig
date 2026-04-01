@@ -111,7 +111,9 @@ pub const MetaData = extern struct {
     freelist_page: PageId,
     /// Highest allocated page ID
     last_page_id: PageId,
-    /// Current write offset in WAL file
+    /// Current write offset in WAL file.
+    /// Reserved for future bookkeeping; the current recovery path derives
+    /// active replay state from the WAL file itself instead of this field.
     wal_offset: u64,
 
     /// Initialize a new metadata structure with default values.
@@ -151,6 +153,8 @@ pub const WalRecordType = enum(u8) {
 
 /// Header structure for each WAL record.
 /// Stored as packed struct for compact binary representation.
+/// The checksum covers the header fields after `checksum` plus the record
+/// payload, so replay can detect torn or corrupted records.
 pub const WalRecordHeader = packed struct {
     /// CRC32 checksum of record data (excluding this field)
     checksum: u32,
@@ -185,14 +189,16 @@ pub const NodeHeader = packed struct {
 // Tests
 // =============================================================================
 
-test "constants" {
-    // Verify page size matches standard expectation
+test "constants: metadata layout" {
+    // Lock the core on-disk constants so future format edits do not silently
+    // change page sizing expectations.
     try std.testing.expectEqual(4096, PAGE_SIZE);
 
-    // Verify metadata structure size is reasonable
-    // (should be small enough to fit in a page with room for other data)
+    // Keep metadata compact enough to live comfortably in page 0 alongside any
+    // future header-adjacent bookkeeping.
     try std.testing.expectEqual(48, @sizeOf(MetaData));
 
-    // Ensure metadata can fit within a single page
+    // Reassert the broader invariant that the metadata header always fits in a
+    // single fixed-size page.
     try std.testing.expect(@sizeOf(MetaData) <= PAGE_SIZE);
 }

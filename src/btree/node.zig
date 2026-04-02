@@ -9,11 +9,15 @@ const Error = constants.Error;
 const NodeType = constants.NodeType;
 const NodeHeader = constants.NodeHeader;
 const PAGE_SIZE = constants.PAGE_SIZE;
+const MAX_KEY_SIZE = constants.MAX_KEY_SIZE;
+const MAX_VALUE_SIZE = constants.MAX_VALUE_SIZE;
+const INVALID_PAGE_ID = constants.INVALID_PAGE_ID;
 const KeyInfo = layout.KeyInfo;
 const HEADER_SIZE = layout.HEADER_SIZE;
 const MAX_KEYS = layout.MAX_KEYS;
 const KEY_INFO_SIZE = layout.KEY_INFO_SIZE;
 const DATA_START_OFFSET = layout.DATA_START_OFFSET;
+const CHILD_AREA_OFFSET = PAGE_SIZE - @sizeOf(PageId) * (MAX_KEYS + 1);
 
 /// Represents a B-tree node stored in a database page.
 ///
@@ -46,6 +50,86 @@ pub const BTreeNode = struct {
         };
     }
 
+    /// Return the raw on-page node-type tag before trusting the decoded enum.
+    fn rawNodeType(self: *const BTreeNode) u8 {
+        return self.page.data[0];
+    }
+
+    /// Validate that one payload region is within bounds and does not overflow.
+    fn validateRange(start: usize, len: usize, limit: usize) !usize {
+        if (start < DATA_START_OFFSET or start > limit) {
+            return Error.CorruptedData;
+        }
+        const end = std.math.add(usize, start, len) catch return Error.CorruptedData;
+        if (end > limit) {
+            return Error.CorruptedData;
+        }
+        return end;
+    }
+
+    /// Validate that two entry payload regions do not overlap each other.
+    fn validateNoOverlap(left_start: usize, left_end: usize, right_start: usize, right_end: usize) !void {
+        if (left_start < right_end and right_start < left_end) {
+            return Error.CorruptedData;
+        }
+    }
+
+    /// Validate this node's header, entry layout, and child references.
+    pub fn validate(self: *const BTreeNode, page_count: PageId) !void {
+        const raw_type = self.rawNodeType();
+        if (raw_type != @intFromEnum(NodeType.leaf) and raw_type != @intFromEnum(NodeType.internal)) {
+            return Error.CorruptedData;
+        }
+
+        if (self.header.num_keys > MAX_KEYS) {
+            return Error.CorruptedData;
+        }
+
+        const is_internal = raw_type == @intFromEnum(NodeType.internal);
+        const payload_limit = if (is_internal) CHILD_AREA_OFFSET else PAGE_SIZE;
+        const key_infos = self.getKeyInfoSlice();
+
+        for (key_infos, 0..) |key_info, i| {
+            if (key_info.key_len == 0 or key_info.key_len > MAX_KEY_SIZE) {
+                return Error.CorruptedData;
+            }
+            if (key_info.value_len > MAX_VALUE_SIZE) {
+                return Error.CorruptedData;
+            }
+
+            const key_start: usize = key_info.key_offset;
+            const key_end = try validateRange(key_start, key_info.key_len, payload_limit);
+            const value_start: usize = key_info.value_offset;
+            const value_end = try validateRange(value_start, key_info.value_len, payload_limit);
+            if (value_start != key_end) {
+                return Error.CorruptedData;
+            }
+            if (is_internal and key_info.value_len != 0) {
+                return Error.CorruptedData;
+            }
+
+            for (key_infos[i + 1 ..]) |other| {
+                const other_key_start: usize = other.key_offset;
+                const other_key_end = try validateRange(other_key_start, other.key_len, payload_limit);
+                const other_value_start: usize = other.value_offset;
+                const other_value_end = try validateRange(other_value_start, other.value_len, payload_limit);
+                try validateNoOverlap(key_start, value_end, other_key_start, other_value_end);
+                _ = other_key_end;
+            }
+        }
+
+        if (!is_internal) {
+            return;
+        }
+
+        for (0..@as(usize, self.header.num_keys) + 1) |child_index| {
+            const child_page_id = self.getChildPageId(@intCast(child_index));
+            if (child_page_id == INVALID_PAGE_ID or child_page_id >= page_count) {
+                return Error.CorruptedData;
+            }
+        }
+    }
+
     /// Write the cached header back to the page.
     ///
     /// Call this after modifying the header (e.g., after insert/delete)
@@ -60,8 +144,8 @@ pub const BTreeNode = struct {
     ///
     /// Returns a slice containing only the entries that are currently
     /// in use (from index 0 to num_keys-1).
-    pub fn getKeyInfoSlice(self: *BTreeNode) []KeyInfo {
-        const ptr: [*]KeyInfo = @ptrCast(@alignCast(&self.page.data[HEADER_SIZE]));
+    pub fn getKeyInfoSlice(self: *const BTreeNode) []const KeyInfo {
+        const ptr: [*]const KeyInfo = @ptrCast(@alignCast(&self.page.data[HEADER_SIZE]));
         return ptr[0..self.header.num_keys];
     }
 
@@ -107,7 +191,7 @@ pub const BTreeNode = struct {
     ///   - index: Index of the child (0 to num_keys)
     ///
     /// Returns: PageId of the child page
-    pub fn getChildPageId(self: *BTreeNode, index: u16) PageId {
+    pub fn getChildPageId(self: *const BTreeNode, index: u16) PageId {
         std.debug.assert(self.header.node_type == .internal);
         std.debug.assert(index <= self.header.num_keys);
 

@@ -16,6 +16,36 @@ const kvdb_delete = root.kvdb_delete;
 const PageId = constants.PageId;
 const ROOT_PAGE_ID = constants.ROOT_PAGE_ID;
 
+test "kvdb: verify reports corrupted node page" {
+    const allocator = std.testing.allocator;
+    const test_path = "test_kvdb_verify_corrupt_node.db";
+
+    defer std.fs.cwd().deleteFile(test_path) catch {};
+    defer std.fs.cwd().deleteFile("test_kvdb_verify_corrupt_node.db.wal") catch {};
+
+    {
+        var db = try Database.open(allocator, test_path, .{});
+        defer db.close();
+
+        try db.put("alpha", "one");
+        try db.put("beta", "two");
+        try db.pager.flush();
+
+        const root_page = try db.pager.getPage(ROOT_PAGE_ID);
+        root_page.data[0] = 0;
+        root_page.markDirty();
+        try db.pager.flush();
+    }
+
+    {
+        var db = try Database.open(allocator, test_path, .{});
+        defer db.close();
+
+        try std.testing.expectError(Error.CorruptedData, db.verify());
+        try std.testing.expectError(Error.CorruptedData, db.inspect());
+    }
+}
+
 test "kvdb: basic operations" {
     const allocator = std.testing.allocator;
     const test_path = "test_kvdb.db";
@@ -93,6 +123,37 @@ test "kvdb: transaction commit" {
     try std.testing.expect(value != null);
     try std.testing.expectEqualStrings("value1", value.?);
     defer allocator.free(value.?);
+}
+
+test "kvdb: batch fsync policy persists after clean close" {
+    const allocator = std.testing.allocator;
+    const test_path = "test_batch_policy_close.db";
+
+    defer std.fs.cwd().deleteFile(test_path) catch {};
+    defer std.fs.cwd().deleteFile("test_batch_policy_close.db.wal") catch {};
+
+    {
+        var db = try Database.open(allocator, test_path, .{ .fsync_policy = .batch });
+        defer db.close();
+
+        try db.put("mode", "batch");
+        try db.put("state", "closed-cleanly");
+    }
+
+    {
+        var db = try Database.open(allocator, test_path, .{ .fsync_policy = .batch });
+        defer db.close();
+
+        const mode = try db.get("mode");
+        try std.testing.expect(mode != null);
+        try std.testing.expectEqualStrings("batch", mode.?);
+        defer allocator.free(mode.?);
+
+        const state = try db.get("state");
+        try std.testing.expect(state != null);
+        try std.testing.expectEqualStrings("closed-cleanly", state.?);
+        defer allocator.free(state.?);
+    }
 }
 
 test "kvdb: repeated updates avoid leaf payload churn" {
@@ -528,7 +589,6 @@ test "kvdb: inspect reports fresh database shape" {
     try std.testing.expectEqual(constants.INVALID_PAGE_ID, stats.freelist_page);
     try std.testing.expectEqual(@as(usize, 0), stats.freelist_page_count);
     try std.testing.expectEqual(ROOT_PAGE_ID, stats.last_page_id);
-    try std.testing.expectEqual(@as(u64, 0), stats.wal_offset);
     try std.testing.expectEqual(@as(usize, 1), stats.tree_height);
     try std.testing.expectEqual(@as(usize, 1), stats.node_count);
     try std.testing.expectEqual(@as(usize, 1), stats.leaf_count);

@@ -10,6 +10,8 @@ const _tests = @import("kvdb/tests.zig");
 pub const Error = constants.Error;
 /// Stable C ABI status enum shared by the exported FFI entry points.
 pub const KVDB_Status = types.KVDB_Status;
+/// File sync policy controlling durability/latency tradeoffs.
+pub const FsyncPolicy = types.FsyncPolicy;
 /// Database open-time configuration options.
 pub const Options = types.Options;
 /// Opaque database handle type exposed to C callers.

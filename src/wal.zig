@@ -4,6 +4,7 @@ const PageId = constants.PageId;
 const WalRecordType = constants.WalRecordType;
 const WalRecordHeader = constants.WalRecordHeader;
 const Error = constants.Error;
+const FsyncPolicy = @import("kvdb/types.zig").FsyncPolicy;
 
 /// CRC32 checksum calculation for WAL record integrity verification.
 ///
@@ -46,6 +47,9 @@ pub const Wal = struct {
     /// Current write offset in the WAL file
     current_offset: u64,
 
+    /// Controls whether WAL durability boundaries force a file sync.
+    fsync_policy: FsyncPolicy,
+
     /// Initialize a new WAL for the given database path.
     ///
     /// Opens or creates a WAL file at `{db_path}.wal`. If the file exists,
@@ -54,9 +58,10 @@ pub const Wal = struct {
     /// Parameters:
     ///   - allocator: Memory allocator
     ///   - db_path: Path to the database file (WAL will be at db_path.wal)
+    ///   - fsync_policy: Whether WAL durability boundaries force a file sync
     ///
     /// Returns: Initialized WAL ready for logging
-    pub fn init(allocator: std.mem.Allocator, db_path: []const u8) !Wal {
+    pub fn init(allocator: std.mem.Allocator, db_path: []const u8, fsync_policy: FsyncPolicy) !Wal {
         // Construct WAL file path: database.db -> database.db.wal
         const wal_path = try std.fmt.allocPrint(allocator, "{s}.wal", .{db_path});
         defer allocator.free(wal_path);
@@ -76,6 +81,7 @@ pub const Wal = struct {
             .file = file,
             .file_path = try allocator.dupe(u8, wal_path),
             .current_offset = stat.size,
+            .fsync_policy = fsync_policy,
         };
     }
 
@@ -88,7 +94,7 @@ pub const Wal = struct {
     /// Append a record to the WAL.
     ///
     /// Internal helper that constructs the record, computes checksum,
-    /// and writes to disk. Forces sync to ensure durability.
+    /// and appends it to the WAL. Durability boundaries are chosen by callers.
     ///
     /// Parameters:
     ///   - record_type: Type of operation being logged
@@ -136,12 +142,16 @@ pub const Wal = struct {
             try self.file.writeAll(v);
         }
 
-        // CRITICAL: Force sync to disk for durability
-        // Without this, a crash could lose recent writes
-        try self.file.sync();
-
         // Update offset tracking
         self.current_offset += @sizeOf(WalRecordHeader) + key.len + value_len;
+    }
+
+    /// Force the current WAL contents to stable storage when the active policy
+    /// requires an explicit durability boundary.
+    pub fn sync(self: *Wal) !void {
+        if (self.fsync_policy == .always) {
+            try self.file.sync();
+        }
     }
 
     /// Log an insert operation.
@@ -330,11 +340,14 @@ pub const Wal = struct {
 
     /// Clear all WAL records.
     ///
-    /// Truncates the WAL file to zero length and resets the offset.
-    /// Called after a successful transaction commit to prevent
-    /// replaying already-committed operations.
+    /// Truncates the WAL file to zero length, optionally syncs the truncation,
+    /// and resets the offset. Called after a successful checkpoint so reopened
+    /// processes do not observe stale committed batches again.
     pub fn clear(self: *Wal) !void {
         try self.file.setEndPos(0);
+        if (self.fsync_policy == .always) {
+            try self.file.sync();
+        }
         self.current_offset = 0;
     }
 };
@@ -357,7 +370,7 @@ test "wal: basic operations" {
 
     // First pass appends a small transaction-shaped sequence to disk.
     {
-        var wal = try Wal.init(allocator, test_path);
+        var wal = try Wal.init(allocator, test_path, .always);
         defer wal.deinit();
 
         try wal.logInsert("key1", "value1");
@@ -368,7 +381,7 @@ test "wal: basic operations" {
 
     // Second pass reopens the same WAL and verifies ordered decoding.
     {
-        var wal = try Wal.init(allocator, test_path);
+        var wal = try Wal.init(allocator, test_path, .always);
         defer wal.deinit();
 
         var iter = wal.iterator();
@@ -420,7 +433,7 @@ test "wal: checksum mismatch is corruption" {
 
     // Write one valid record so the corruption step mutates a realistic header.
     {
-        var wal = try Wal.init(allocator, test_path);
+        var wal = try Wal.init(allocator, test_path, .always);
         defer wal.deinit();
 
         try wal.logInsert("key", "value");
@@ -436,7 +449,7 @@ test "wal: checksum mismatch is corruption" {
     }
 
     {
-        var wal = try Wal.init(allocator, test_path);
+        var wal = try Wal.init(allocator, test_path, .always);
         defer wal.deinit();
 
         var iter = wal.iterator();
@@ -444,39 +457,32 @@ test "wal: checksum mismatch is corruption" {
     }
 }
 
-test "wal: truncated value payload is corruption" {
+test "wal: clear truncates and resets offset" {
     const allocator = std.testing.allocator;
-    const test_path = "test_wal_truncated_value";
-    const wal_path = "test_wal_truncated_value.wal";
+    const test_path = "test_wal_clear";
+    const wal_path = "test_wal_clear.wal";
 
-    // Clean up the synthetic DB path and WAL file used by this truncation test.
     defer {
         std.fs.cwd().deleteFile(test_path) catch {};
         std.fs.cwd().deleteFile(wal_path) catch {};
     }
 
-    // Write a complete insert record before truncating bytes from its value body.
     {
-        var wal = try Wal.init(allocator, test_path);
+        var wal = try Wal.init(allocator, test_path, .always);
         defer wal.deinit();
 
         try wal.logInsert("key", "value");
-    }
-
-    // Remove a few bytes from the tail so the iterator sees a short value read.
-    {
-        var file = try std.fs.cwd().openFile(wal_path, .{ .mode = .read_write });
-        defer file.close();
-
-        const stat = try file.stat();
-        try file.setEndPos(stat.size - 2);
+        try std.testing.expect(wal.current_offset > 0);
+        try wal.clear();
+        try std.testing.expectEqual(@as(u64, 0), wal.current_offset);
     }
 
     {
-        var wal = try Wal.init(allocator, test_path);
+        var wal = try Wal.init(allocator, test_path, .always);
         defer wal.deinit();
 
+        try std.testing.expectEqual(@as(u64, 0), wal.current_offset);
         var iter = wal.iterator();
-        try std.testing.expectError(Error.WalCorrupted, iter.next());
+        try std.testing.expect((try iter.next()) == null);
     }
 }

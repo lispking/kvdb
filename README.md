@@ -240,6 +240,7 @@ defer db.close();
 // Open with custom options
 var db = try Database.open(allocator, "path/to/db", .{
     .enable_wal = true,
+    .fsync_policy = .always,
 });
 ```
 
@@ -395,7 +396,6 @@ kvdb-cli my.db inspect
 #   Freelist Head: 18446744073709551615
 #   Freelist Pages: 0
 #   Last Page ID: 1
-#   WAL Offset: 0
 # B-Tree
 #   Height: 1
 #   Nodes: 1
@@ -450,7 +450,7 @@ zig build
 ./zig-out/bin/benchmark
 ```
 
-The current benchmark binary reports these deterministic workloads:
+The current benchmark binary reports these deterministic workloads under both `fsync_policy = .always` and `fsync_policy = .batch`:
 - sequential inserts
 - random inserts
 - point lookups
@@ -459,7 +459,7 @@ The current benchmark binary reports these deterministic workloads:
 - deletes
 - compaction
 
-Each run uses fixed operation counts and a fixed PRNG seed so results are comparable across changes.
+Each run uses fixed operation counts and a fixed PRNG seed so results are comparable across changes. Comparing the paired policy rows shows the durability/latency tradeoff without changing workload shape.
 
 ### FFI Example
 
@@ -608,10 +608,18 @@ kvdb/
 pub const Options = struct {
     /// Enable Write-Ahead Logging record writing and startup recovery.
     enable_wal: bool = true,
+    /// Choose whether commit/checkpoint paths force data to stable storage.
+    fsync_policy: FsyncPolicy = .always,
 };
 ```
 
-**Note:** WAL controls both record logging and startup recovery replay.
+`enable_wal` controls whether KVDB writes WAL records and performs startup replay at all.
+
+`fsync_policy` controls how aggressively KVDB asks the OS to persist durability boundaries:
+- `.always`: call `file.sync()` at WAL commit/checkpoint and page-flush boundaries for the strongest current durability behavior
+- `.batch`: keep the same write ordering but skip explicit sync calls, which can improve throughput while allowing recent writes to remain in OS buffers after a crash or power loss
+
+**Note:** WAL changes replay semantics only when enabled; `fsync_policy` changes durability cost, not logical recovery rules.
 
 ### Constants
 
@@ -632,6 +640,7 @@ pub const Options = struct {
 2. **Reuse Connections**: Keep database open for multiple operations
 3. **Page Size**: The current engine uses fixed 4KB pages internally
 4. **Disable WAL**: Only disable WAL if you intentionally want to skip WAL record logging
+5. **Tune fsync policy**: Use `.always` for the strongest current durability behavior and `.batch` when benchmark throughput matters more than surviving the most recent buffered writes
 
 ### Known Limitations
 

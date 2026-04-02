@@ -4,6 +4,11 @@ const PAGE_SIZE = constants.PAGE_SIZE;
 const PageId = constants.PageId;
 const INVALID_PAGE_ID = constants.INVALID_PAGE_ID;
 const Error = constants.Error;
+const FsyncPolicy = @import("kvdb/types.zig").FsyncPolicy;
+
+/// Flush-time pruning keeps cache growth bounded without evicting pages while
+/// callers may still hold raw `*Page` pointers during tree traversal.
+const PAGE_CACHE_LIMIT: usize = 32;
 
 /// Header stored inside pages that have been returned to the freelist.
 const FreePageHeader = packed struct {
@@ -100,6 +105,13 @@ pub const Pager = struct {
     /// Fast page-id-to-cache-index lookup to avoid linear scans on every getPage.
     cache_index: CacheIndex,
 
+    /// Flush-time cache pruning keeps resident memory bounded between durable
+    /// boundaries without invalidating raw page pointers mid-operation.
+    cache_limit: usize,
+
+    /// Controls whether flush boundaries force data to stable storage.
+    fsync_policy: FsyncPolicy,
+
     /// Next page ID to allocate.
     /// Incremented when creating new pages. Initialized from file size on open.
     next_page_id: PageId,
@@ -112,9 +124,10 @@ pub const Pager = struct {
     /// Parameters:
     ///   - allocator: Memory allocator for internal structures
     ///   - file_path: Path to the database file
+    ///   - fsync_policy: Whether flush boundaries force a file sync
     ///
     /// Returns: Initialized Pager ready for use
-    pub fn init(allocator: std.mem.Allocator, file_path: []const u8) !Pager {
+    pub fn init(allocator: std.mem.Allocator, file_path: []const u8, fsync_policy: FsyncPolicy) !Pager {
         // Open or create the database file with read-write access
         const file = try std.fs.cwd().createFile(file_path, .{
             .read = true,
@@ -138,6 +151,8 @@ pub const Pager = struct {
             .page_size = PAGE_SIZE,
             .cache = cache,
             .cache_index = cache_index,
+            .cache_limit = PAGE_CACHE_LIMIT,
+            .fsync_policy = fsync_policy,
             .next_page_id = if (file_size == 0) 0 else @intCast(file_size / PAGE_SIZE),
         };
 
@@ -232,6 +247,51 @@ pub const Pager = struct {
             return page;
         }
         return self.createCachedPage(page_id);
+    }
+
+    /// Return true when this page must stay resident in the cache.
+    fn isReservedCachePage(_self: *Pager, page_id: PageId) bool {
+        _ = _self;
+        return page_id <= constants.ROOT_PAGE_ID;
+    }
+
+    /// Return whether this cache entry can be safely evicted after a flush.
+    fn isEvictableCacheEntry(self: *Pager, entry: CacheEntry) bool {
+        return !entry.page.is_dirty and !self.isReservedCachePage(entry.page_id);
+    }
+
+    /// Remove one cached page and keep `cache_index` aligned with the packed list.
+    fn removeCacheEntryAt(self: *Pager, index: usize) void {
+        const removed = self.cache.items[index];
+        _ = self.cache_index.remove(removed.page_id);
+        self.allocator.destroy(removed.page);
+
+        const last_index = self.cache.items.len - 1;
+        if (index != last_index) {
+            const moved = self.cache.items[last_index];
+            self.cache.items[index] = moved;
+            self.cache_index.put(moved.page_id, index) catch unreachable;
+        }
+        _ = self.cache.pop();
+    }
+
+    /// Drop old clean pages after a durable boundary so cache growth stays bounded.
+    fn pruneCache(self: *Pager) void {
+        if (self.cache.items.len <= self.cache_limit) {
+            return;
+        }
+
+        var index = self.cache.items.len;
+        while (self.cache.items.len > self.cache_limit and index > 0) {
+            index -= 1;
+            if (!self.isEvictableCacheEntry(self.cache.items[index])) {
+                continue;
+            }
+            self.removeCacheEntryAt(index);
+            if (index > self.cache.items.len) {
+                index = self.cache.items.len;
+            }
+        }
     }
 
     /// Read the freelist head from metadata once bootstrapping has finished.
@@ -428,8 +488,13 @@ pub const Pager = struct {
                 page.is_dirty = false;
             }
         }
-        // Ensure data is physically written to disk
-        try self.file.sync();
+        if (self.fsync_policy == .always) {
+            // Ensure data is physically written to disk before any clean pages are
+            // dropped from cache, so pointer invalidation only happens after a
+            // durable boundary chosen by the caller.
+            try self.file.sync();
+        }
+        self.pruneCache();
     }
 
     /// Read database metadata from page 0.
@@ -504,7 +569,7 @@ test "pager: basic operations" {
     // First open should bootstrap the reserved metadata/root pages and persist
     // any newly allocated pages when flushed.
     {
-        var p = try Pager.init(allocator, test_path);
+        var p = try Pager.init(allocator, test_path, .always);
         defer p.deinit();
 
         // A fresh database starts with exactly page 0 metadata and page 1 root.
@@ -524,7 +589,7 @@ test "pager: basic operations" {
 
     // Reopening the file should recover the exact page count written above.
     {
-        var p = try Pager.init(allocator, test_path);
+        var p = try Pager.init(allocator, test_path, .always);
         defer p.deinit();
 
         try std.testing.expectEqual(@as(PageId, 3), p.pageCount());
@@ -537,7 +602,7 @@ test "pager: freed pages are reused before file growth" {
     defer std.fs.cwd().deleteFile(test_path) catch {};
 
     {
-        var p = try Pager.init(allocator, test_path);
+        var p = try Pager.init(allocator, test_path, .always);
         defer p.deinit();
 
         // Grow beyond the reserved pages so a later free has a reusable target.
@@ -564,7 +629,7 @@ test "pager: cache lookup returns same page instance" {
     const test_path = "test_pager_cache_lookup.db";
     defer std.fs.cwd().deleteFile(test_path) catch {};
 
-    var p = try Pager.init(allocator, test_path);
+    var p = try Pager.init(allocator, test_path, .always);
     defer p.deinit();
 
     const first = try p.getPage(constants.ROOT_PAGE_ID);
@@ -576,13 +641,92 @@ test "pager: cache lookup returns same page instance" {
     try std.testing.expectEqual(@as(usize, 2), p.cache_index.count());
 }
 
+test "pager: flush prunes clean cache entries to configured limit" {
+    const allocator = std.testing.allocator;
+    const test_path = "test_pager_cache_prune.db";
+    defer std.fs.cwd().deleteFile(test_path) catch {};
+
+    var p = try Pager.init(allocator, test_path, .always);
+    defer p.deinit();
+
+    var pages: [PAGE_CACHE_LIMIT + 4]*Page = undefined;
+    for (&pages, 0..) |*slot, index| {
+        const page = try p.allocatePage();
+        page.asSlice()[0] = @as(u8, @intCast(index));
+        page.markDirty();
+        slot.* = page;
+    }
+
+    try std.testing.expectEqual(@as(usize, PAGE_CACHE_LIMIT + 6), p.cache.items.len);
+    try p.flush();
+
+    try std.testing.expectEqual(PAGE_CACHE_LIMIT, p.cache.items.len);
+    try std.testing.expectEqual(PAGE_CACHE_LIMIT, p.cache_index.count());
+    try std.testing.expect(try p.getPage(constants.META_PAGE_ID) == try p.getPage(constants.META_PAGE_ID));
+    try std.testing.expect(try p.getPage(constants.ROOT_PAGE_ID) == try p.getPage(constants.ROOT_PAGE_ID));
+}
+
+test "pager: flush keeps dirty pages resident until they become clean" {
+    const allocator = std.testing.allocator;
+    const test_path = "test_pager_cache_dirty.db";
+    defer std.fs.cwd().deleteFile(test_path) catch {};
+
+    var p = try Pager.init(allocator, test_path, .always);
+    defer p.deinit();
+
+    var pages: [PAGE_CACHE_LIMIT + 4]*Page = undefined;
+    for (&pages) |*slot| {
+        slot.* = try p.allocatePage();
+    }
+
+    const recycled_page_id = pages[pages.len - 1].id;
+
+    try p.flush();
+    try std.testing.expectEqual(PAGE_CACHE_LIMIT, p.cache.items.len);
+
+    const dirty_page = try p.getPage(recycled_page_id);
+    dirty_page.asSlice()[0] = 99;
+    dirty_page.markDirty();
+
+    // Loading one previously evicted page can temporarily push cache usage above
+    // the bound, but its dirty state must keep it resident until the next flush.
+    try std.testing.expectEqual(@as(usize, PAGE_CACHE_LIMIT + 1), p.cache.items.len);
+    try p.flush();
+
+    try std.testing.expectEqual(PAGE_CACHE_LIMIT, p.cache.items.len);
+    const reloaded = try p.getPage(recycled_page_id);
+    try std.testing.expectEqual(@as(u8, 99), reloaded.asSlice()[0]);
+}
+
+test "pager: flush keeps reserved pages resident" {
+    const allocator = std.testing.allocator;
+    const test_path = "test_pager_cache_reserved.db";
+    defer std.fs.cwd().deleteFile(test_path) catch {};
+
+    var p = try Pager.init(allocator, test_path, .always);
+    defer p.deinit();
+
+    const meta_page = try p.getPage(constants.META_PAGE_ID);
+    const root_page = try p.getPage(constants.ROOT_PAGE_ID);
+
+    var pages: [PAGE_CACHE_LIMIT + 4]*Page = undefined;
+    for (&pages) |*slot| {
+        slot.* = try p.allocatePage();
+    }
+
+    try p.flush();
+
+    try std.testing.expect(meta_page == try p.getPage(constants.META_PAGE_ID));
+    try std.testing.expect(root_page == try p.getPage(constants.ROOT_PAGE_ID));
+}
+
 test "pager: freelist survives reopen" {
     const allocator = std.testing.allocator;
     const test_path = "test_pager_freelist_reopen.db";
     defer std.fs.cwd().deleteFile(test_path) catch {};
 
     {
-        var p = try Pager.init(allocator, test_path);
+        var p = try Pager.init(allocator, test_path, .always);
         defer p.deinit();
 
         // Free one allocated page, then flush so the reopen phase must recover
@@ -594,7 +738,7 @@ test "pager: freelist survives reopen" {
     }
 
     {
-        var p = try Pager.init(allocator, test_path);
+        var p = try Pager.init(allocator, test_path, .always);
         defer p.deinit();
 
         const recycled = try p.allocatePage();

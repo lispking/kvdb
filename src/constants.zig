@@ -111,10 +111,6 @@ pub const MetaData = extern struct {
     freelist_page: PageId,
     /// Highest allocated page ID
     last_page_id: PageId,
-    /// Current write offset in WAL file.
-    /// Reserved for future bookkeeping; the current recovery path derives
-    /// active replay state from the WAL file itself instead of this field.
-    wal_offset: u64,
 
     /// Initialize a new metadata structure with default values.
     /// Returns a properly configured MetaData for a new database.
@@ -126,7 +122,6 @@ pub const MetaData = extern struct {
             .root_page = ROOT_PAGE_ID,
             .freelist_page = INVALID_PAGE_ID,
             .last_page_id = ROOT_PAGE_ID,
-            .wal_offset = 0,
         };
     }
 
@@ -196,7 +191,7 @@ test "constants: metadata layout" {
 
     // Keep metadata compact enough to live comfortably in page 0 alongside any
     // future header-adjacent bookkeeping.
-    try std.testing.expectEqual(48, @sizeOf(MetaData));
+    try std.testing.expectEqual(40, @sizeOf(MetaData));
 
     // Reassert the broader invariant that the metadata header always fits in a
     // single fixed-size page.

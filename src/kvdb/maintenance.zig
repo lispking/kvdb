@@ -33,8 +33,6 @@ pub const InspectStats = struct {
     freelist_page_count: usize,
     /// Highest page ID ever grown from the file.
     last_page_id: PageId,
-    /// Metadata WAL offset field reserved in the on-disk header.
-    wal_offset: u64,
     /// Tree height measured in levels including the root.
     tree_height: usize,
     /// Total reachable B-tree node count.
@@ -159,7 +157,6 @@ pub fn inspect(self: *Database) !InspectStats {
         .freelist_page = metadata.freelist_page,
         .freelist_page_count = try self.pager.freelistPageCount(),
         .last_page_id = metadata.last_page_id,
-        .wal_offset = metadata.wal_offset,
         .tree_height = tree_stats.tree_height,
         .node_count = tree_stats.node_count,
         .leaf_count = tree_stats.leaf_count,

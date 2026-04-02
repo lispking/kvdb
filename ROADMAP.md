@@ -195,7 +195,7 @@ The main gaps are:
 ### 3.3 Connect metadata to real storage behavior
 - [x] Make `freelist_page` meaningful
 - [x] Make `last_page_id` authoritative
-- [ ] Revisit whether `wal_offset` belongs in metadata or recovery state
+- [x] Revisit whether `wal_offset` belongs in metadata or recovery state
 
 ### 3.4 Strengthen compaction
 - [x] Validate compacted output against source DB
@@ -220,18 +220,18 @@ The main gaps are:
 - [x] Add `inspect` command for metadata/page/tree summary
 - [x] Add `dump` / `export` command
 - [x] Add `load` / `import` command
-- [ ] Consider range or prefix scan commands after iterator work lands
+- [x] Consider range or prefix scan commands after iterator work lands
 
 ### 4.2 Add consistency verification tooling
 - [x] Validate metadata header
-- [ ] Validate page/node headers
+- [x] Validate page/node headers
 - [x] Validate B-tree key ordering
 - [x] Validate WAL checksums and record structure
 
 ### 4.3 Improve error reporting UX
-- [ ] Map internal errors to clearer CLI output
-- [ ] Differentiate corruption vs not-found vs invalid usage
-- [ ] Return actionable messages for recovery-related failures
+- [x] Map internal errors to clearer CLI output
+- [x] Differentiate corruption vs not-found vs invalid usage
+- [x] Return actionable messages for recovery-related failures
 
 **Deliverable:** Users can inspect and validate DB state without reading raw files.
 
@@ -283,9 +283,9 @@ The main gaps are:
 
 ### 6.2 Improve cache and write behavior
 - [x] Evaluate page cache lookup strategy
-- [ ] Add eviction policy if cache growth becomes unbounded
-- [ ] Revisit flush frequency and WAL sync strategy
-- [ ] Compare correctness/performance tradeoffs for fsync policy
+- [x] Add eviction policy if cache growth becomes unbounded
+- [x] Revisit flush frequency and WAL sync strategy
+- [x] Compare correctness/performance tradeoffs for fsync policy
 
 ### 6.3 Fix CI rough edges
 - [x] Fix `lint` workflow matrix/config mismatch

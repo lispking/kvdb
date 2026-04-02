@@ -101,13 +101,16 @@ pub fn recoverFromWal(self: *Database) !void {
 
         pub fn onCommit(callback_self: @This()) !void {
             // Apply only the operations belonging to the committed batch.
+            // Recovery treats a synced commit marker as the durable boundary,
+            // then checkpoints the replayed data back into the main DB file.
             for (callback_self.pending.items) |op| {
                 switch (op) {
                     .insert => |entry| try applyInsertNoWal(callback_self.db, entry.key, entry.value),
                     .delete => |key| try applyDeleteNoWal(callback_self.db, key),
                 }
             }
-            // Persist replayed changes before truncating the WAL.
+            // Persist replayed changes before truncating the WAL according to
+            // the configured fsync policy.
             try callback_self.db.pager.flush();
             clearPendingWalOps(callback_self.allocator, callback_self.pending);
         }

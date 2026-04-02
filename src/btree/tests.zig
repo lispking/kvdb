@@ -14,6 +14,7 @@ const DATA_START_OFFSET = btree.DATA_START_OFFSET;
 const VerifyStats = BTree.VerifyStats;
 const InspectStats = BTree.InspectStats;
 const Error = constants.Error;
+const KeyInfo = btree.KeyInfo;
 
 fn initEmptyRootLeaf(p: *Pager) !void {
     // Reuse the reserved root page as a pristine leaf before each test scenario.
@@ -26,13 +27,125 @@ fn initEmptyRootLeaf(p: *Pager) !void {
     root_page.markDirty();
 }
 
+fn keyInfoPtr(node: *BTreeNode) [*]KeyInfo {
+    return @ptrCast(@alignCast(&node.page.data[HEADER_SIZE]));
+}
+
+test "btree: verify rejects invalid node type header" {
+    const allocator = std.testing.allocator;
+    const test_path = "test_btree_invalid_node_type.db";
+    defer std.fs.cwd().deleteFile(test_path) catch {};
+
+    var p = try Pager.init(allocator, test_path, .always);
+    defer p.deinit();
+    try initEmptyRootLeaf(&p);
+
+    const root_page = try p.getPage(constants.ROOT_PAGE_ID);
+    root_page.data[0] = 99;
+    root_page.markDirty();
+
+    var tree = BTree.init(constants.ROOT_PAGE_ID);
+    try std.testing.expectError(Error.CorruptedData, tree.verify(&p));
+    try std.testing.expectError(Error.CorruptedData, tree.inspect(&p));
+}
+
+test "btree: verify rejects out-of-bounds leaf payload" {
+    const allocator = std.testing.allocator;
+    const test_path = "test_btree_invalid_payload.db";
+    defer std.fs.cwd().deleteFile(test_path) catch {};
+
+    var p = try Pager.init(allocator, test_path, .always);
+    defer p.deinit();
+    try initEmptyRootLeaf(&p);
+
+    const root_page = try p.getPage(constants.ROOT_PAGE_ID);
+    var node = BTreeNode.init(root_page);
+    try node.insertLeaf("alpha", "one");
+
+    const key_infos = keyInfoPtr(&node);
+    key_infos[0].value_offset = constants.PAGE_SIZE - 1;
+    key_infos[0].value_len = 4;
+    root_page.markDirty();
+
+    var tree = BTree.init(constants.ROOT_PAGE_ID);
+    try std.testing.expectError(Error.CorruptedData, tree.verify(&p));
+    try std.testing.expectError(Error.CorruptedData, tree.inspect(&p));
+}
+
+test "btree: verify rejects invalid internal child page id" {
+    const allocator = std.testing.allocator;
+    const test_path = "test_btree_invalid_child.db";
+    defer std.fs.cwd().deleteFile(test_path) catch {};
+
+    var p = try Pager.init(allocator, test_path, .always);
+    defer p.deinit();
+
+    const root_page = try p.getPage(constants.ROOT_PAGE_ID);
+    root_page.clear();
+    var root_node = BTreeNode.init(root_page);
+    root_node.header = .{
+        .node_type = .internal,
+        .num_keys = 1,
+    };
+    root_node.saveHeader();
+
+    const left_page = try p.allocatePage();
+    left_page.clear();
+    var left_node = BTreeNode.init(left_page);
+    left_node.header = .{
+        .node_type = .leaf,
+        .num_keys = 0,
+    };
+    left_node.saveHeader();
+    try left_node.insertLeaf("a", "left");
+
+    const key_infos = keyInfoPtr(&root_node);
+    @memcpy(root_page.data[DATA_START_OFFSET..][0..1], "z");
+    key_infos[0] = .{
+        .key_offset = DATA_START_OFFSET,
+        .key_len = 1,
+        .value_offset = DATA_START_OFFSET + 1,
+        .value_len = 0,
+    };
+    root_node.setChildPageId(0, left_page.id);
+    root_node.setChildPageId(1, constants.INVALID_PAGE_ID);
+
+    var tree = BTree.init(constants.ROOT_PAGE_ID);
+    try std.testing.expectError(Error.CorruptedData, tree.verify(&p));
+    try std.testing.expectError(Error.CorruptedData, tree.inspect(&p));
+}
+
+test "btree: verify rejects overlapping leaf entries" {
+    const allocator = std.testing.allocator;
+    const test_path = "test_btree_overlapping_entries.db";
+    defer std.fs.cwd().deleteFile(test_path) catch {};
+
+    var p = try Pager.init(allocator, test_path, .always);
+    defer p.deinit();
+    try initEmptyRootLeaf(&p);
+
+    const root_page = try p.getPage(constants.ROOT_PAGE_ID);
+    var node = BTreeNode.init(root_page);
+    try node.insertLeaf("alpha", "one");
+    try node.insertLeaf("beta", "two");
+
+    const key_infos = keyInfoPtr(&node);
+    key_infos[1].key_offset = key_infos[0].key_offset;
+    key_infos[1].value_offset = key_infos[1].key_offset + key_infos[1].key_len;
+    root_page.markDirty();
+
+    var tree = BTree.init(constants.ROOT_PAGE_ID);
+    try std.testing.expectError(Error.CorruptedData, tree.verify(&p));
+    try std.testing.expectError(Error.CorruptedData, tree.inspect(&p));
+}
+
 test "btree: duplicate put rejects existing keys across tree growth" {
     const allocator = std.testing.allocator;
     const test_path = "test_btree_duplicate_put.db";
     // Reset the fixture file so duplicate-key assertions only observe this run's tree growth.
     defer std.fs.cwd().deleteFile(test_path) catch {};
 
-    var p = try Pager.init(allocator, test_path);
+    var p = try Pager.init(allocator, test_path, .always);
     defer p.deinit();
     try initEmptyRootLeaf(&p);
 
@@ -67,7 +180,7 @@ test "btree: update missing key returns not found" {
     // Reset the fixture file so the missing-key update path starts from a clean single-leaf tree.
     defer std.fs.cwd().deleteFile(test_path) catch {};
 
-    var p = try Pager.init(allocator, test_path);
+    var p = try Pager.init(allocator, test_path, .always);
     defer p.deinit();
     try initEmptyRootLeaf(&p);
 
@@ -89,7 +202,7 @@ test "btree: delete missing key returns not found" {
     // Reset the fixture file so the missing-delete assertion is isolated from prior runs.
     defer std.fs.cwd().deleteFile(test_path) catch {};
 
-    var p = try Pager.init(allocator, test_path);
+    var p = try Pager.init(allocator, test_path, .always);
     defer p.deinit();
     try initEmptyRootLeaf(&p);
 
@@ -117,7 +230,7 @@ test "btree: empty tree iterator returns null" {
     // Reset the fixture file so the iterator null case starts from an empty persisted tree.
     defer std.fs.cwd().deleteFile(test_path) catch {};
 
-    var p = try Pager.init(allocator, test_path);
+    var p = try Pager.init(allocator, test_path, .always);
     defer p.deinit();
     try initEmptyRootLeaf(&p);
 
@@ -135,7 +248,7 @@ test "btree: verify and inspect summarize multi-level tree" {
     // Reset the fixture file so verify/inspect statistics reflect only this generated tree.
     defer std.fs.cwd().deleteFile(test_path) catch {};
 
-    var p = try Pager.init(allocator, test_path);
+    var p = try Pager.init(allocator, test_path, .always);
     defer p.deinit();
     try initEmptyRootLeaf(&p);
 
@@ -166,7 +279,7 @@ test "btree: iterator stays sorted after mixed-order inserts" {
     // Reset the fixture file so sorted-iteration assertions see only this mixed insert workload.
     defer std.fs.cwd().deleteFile(test_path) catch {};
 
-    var p = try Pager.init(allocator, test_path);
+    var p = try Pager.init(allocator, test_path, .always);
     defer p.deinit();
     try initEmptyRootLeaf(&p);
 
@@ -208,7 +321,7 @@ test "btree: basic operations" {
     const test_path = "test_btree.db";
     defer std.fs.cwd().deleteFile(test_path) catch {};
 
-    var p = try Pager.init(allocator, test_path);
+    var p = try Pager.init(allocator, test_path, .always);
     defer p.deinit();
 
     // Reinitialize the reserved root page as an empty leaf so the test can
@@ -245,7 +358,7 @@ test "btree: root split handles first overflow" {
     const test_path = "test_btree_root_split.db";
     defer std.fs.cwd().deleteFile(test_path) catch {};
 
-    var p = try Pager.init(allocator, test_path);
+    var p = try Pager.init(allocator, test_path, .always);
     defer p.deinit();
 
     // Start from an empty leaf root so the test drives the first overflow path.
@@ -287,7 +400,7 @@ test "btree: internal insert split propagation keeps tree searchable" {
     const test_path = "test_btree_internal_split.db";
     defer std.fs.cwd().deleteFile(test_path) catch {};
 
-    var p = try Pager.init(allocator, test_path);
+    var p = try Pager.init(allocator, test_path, .always);
     defer p.deinit();
 
     // Reset the reserved root page so this test exercises multi-level growth
@@ -334,7 +447,7 @@ test "btree: ordered multi-level search hits separator boundaries" {
     const test_path = "test_btree_ordered_boundaries.db";
     defer std.fs.cwd().deleteFile(test_path) catch {};
 
-    var p = try Pager.init(allocator, test_path);
+    var p = try Pager.init(allocator, test_path, .always);
     defer p.deinit();
 
     // Start from a clean leaf root so ordered inserts alone determine every
@@ -373,7 +486,7 @@ test "btree: mixed-order multi-level inserts remain searchable" {
     const test_path = "test_btree_mixed_multilevel.db";
     defer std.fs.cwd().deleteFile(test_path) catch {};
 
-    var p = try Pager.init(allocator, test_path);
+    var p = try Pager.init(allocator, test_path, .always);
     defer p.deinit();
 
     // Reset the root so a non-monotonic insert order can exercise recursive
@@ -421,7 +534,7 @@ test "btree: iterator traverses multi-page tree in sorted order" {
     const test_path = "test_btree_iterator_multilevel.db";
     defer std.fs.cwd().deleteFile(test_path) catch {};
 
-    var p = try Pager.init(allocator, test_path);
+    var p = try Pager.init(allocator, test_path, .always);
     defer p.deinit();
 
     // Reset the root so iterator coverage starts from a clean tree that must
@@ -462,7 +575,7 @@ test "btree: multi-page delete updates surviving separator search paths" {
     const test_path = "test_btree_delete_multilevel.db";
     defer std.fs.cwd().deleteFile(test_path) catch {};
 
-    var p = try Pager.init(allocator, test_path);
+    var p = try Pager.init(allocator, test_path, .always);
     defer p.deinit();
 
     // Reset the root so delete coverage starts from a deterministic multi-page
@@ -504,7 +617,7 @@ test "btree: multi-page delete rejects unsupported leaf underflow" {
     const test_path = "test_btree_delete_underflow.db";
     defer std.fs.cwd().deleteFile(test_path) catch {};
 
-    var p = try Pager.init(allocator, test_path);
+    var p = try Pager.init(allocator, test_path, .always);
     defer p.deinit();
 
     // Reset the root so this test can create a small manual multi-page layout
@@ -566,7 +679,7 @@ test "btree: repeated updates repack leaf payloads" {
     const test_path = "test_btree_update_repack.db";
     defer std.fs.cwd().deleteFile(test_path) catch {};
 
-    var p = try Pager.init(allocator, test_path);
+    var p = try Pager.init(allocator, test_path, .always);
     defer p.deinit();
 
     // Start from a clean leaf root so repeated updates exercise the repack path

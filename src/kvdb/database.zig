@@ -69,7 +69,7 @@ pub const Database = struct {
     /// Returns: Initialized Database ready for use
     pub fn open(allocator: std.mem.Allocator, path: []const u8, options: Options) !Database {
         // Initialize pager which handles all page I/O
-        var p = try Pager.init(allocator, path);
+        var p = try Pager.init(allocator, path, options.fsync_policy);
         var pager_owned = true;
         errdefer if (pager_owned) p.deinit();
 
@@ -85,7 +85,7 @@ pub const Database = struct {
         // Initialize WAL if enabled
         var wal_instance: ?Wal = null;
         if (options.enable_wal) {
-            wal_instance = try Wal.init(allocator, path);
+            wal_instance = try Wal.init(allocator, path, options.fsync_policy);
         }
         errdefer {
             if (wal_instance) |*w| w.deinit();
@@ -119,14 +119,16 @@ pub const Database = struct {
     /// Close the database and release all resources.
     ///
     /// If a transaction is active, it will be aborted.
-    /// All pending changes are flushed to disk before closing.
+    /// Dirty pages are then flushed to disk before closing, so standalone writes
+    /// can still persist at close even when they were not wrapped in an explicit
+    /// transaction commit.
     pub fn close(self: *Database) void {
         // Abort any active transaction
         if (self.transaction) |*txn| {
             _ = txn.abort() catch {};
         }
 
-        // Flush any remaining dirty pages
+        // Flush any remaining dirty pages using the configured durability mode.
         self.pager.flush() catch {};
 
         // Clean up WAL
@@ -149,7 +151,7 @@ pub const Database = struct {
 
         // Close and reopen pager to discard in-memory changes
         self.pager.deinit();
-        self.pager = try Pager.init(self.allocator, self.db_path);
+        self.pager = try Pager.init(self.allocator, self.db_path, self.options.fsync_policy);
 
         // Restore WAL
         self.wal = wal_instance;
@@ -203,8 +205,9 @@ pub const Database = struct {
     /// entry is created. The operation is logged to WAL if enabled.
     ///
     /// This method does not require an active transaction. It updates the
-    /// current handle's in-memory pages immediately; durability depends on a
-    /// later flush such as commit() or close().
+    /// current handle's in-memory pages immediately. Explicit transaction
+    /// commit remains the atomic durable boundary; outside a transaction,
+    /// persistence still depends on a later flush such as commit() or close().
     ///
     /// Parameters:
     ///   - key: The key to store (must not be empty)
@@ -247,8 +250,9 @@ pub const Database = struct {
     /// Operation is logged to WAL if enabled.
     ///
     /// This method does not require an active transaction. It updates the
-    /// current handle immediately in memory; durability depends on a later
-    /// flush such as commit() or close().
+    /// current handle immediately in memory. Explicit transaction commit remains
+    /// the atomic durable boundary; outside a transaction, persistence still
+    /// depends on a later flush such as commit() or close().
     ///
     /// Parameters:
     ///   - key: The key to delete

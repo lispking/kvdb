@@ -11,8 +11,18 @@ pub const KVDB_Status = enum(c_int) {
     internal_error = 255,
 };
 
+/// File sync policy controlling the tradeoff between durability and latency.
+pub const FsyncPolicy = enum {
+    /// Force commit/checkpoint writes to stable storage before returning.
+    always,
+    /// Preserve write ordering but rely on OS buffering instead of explicit syncs.
+    batch,
+};
+
 /// Configuration options for database initialization.
 pub const Options = struct {
     /// Enable Write-Ahead Logging record writing and startup recovery.
     enable_wal: bool = true,
+    /// Choose whether commit/checkpoint paths force data to stable storage.
+    fsync_policy: FsyncPolicy = .always,
 };

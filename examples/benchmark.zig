@@ -11,7 +11,13 @@ const Workload = enum {
     compaction,
 };
 
+const BenchPolicy = enum {
+    always,
+    batch,
+};
+
 const BenchResult = struct {
+    policy: BenchPolicy,
     workload: Workload,
     operations: usize,
     elapsed_ns: u64,
@@ -43,29 +49,35 @@ pub fn main() !void {
     try stdout.print("  key space: {d}\n", .{config.key_space});
     try stdout.print("  seed: 0x{x}\n\n", .{config.seed});
 
-    const results = [_]BenchResult{
-        try runSequentialInsertBenchmark(allocator, root_dir, config),
-        try runRandomInsertBenchmark(allocator, root_dir, config),
-        try runPointLookupBenchmark(allocator, root_dir, config),
-        try runScanBenchmark(allocator, root_dir, config),
-        try runUpdateBenchmark(allocator, root_dir, config),
-        try runDeleteBenchmark(allocator, root_dir, config),
-        try runCompactionBenchmark(allocator, root_dir, config),
-    };
+    const policies = [_]BenchPolicy{ .always, .batch };
+    for (policies) |policy| {
+        const results = [_]BenchResult{
+            try runSequentialInsertBenchmark(allocator, root_dir, config, policy),
+            try runRandomInsertBenchmark(allocator, root_dir, config, policy),
+            try runPointLookupBenchmark(allocator, root_dir, config, policy),
+            try runScanBenchmark(allocator, root_dir, config, policy),
+            try runUpdateBenchmark(allocator, root_dir, config, policy),
+            try runDeleteBenchmark(allocator, root_dir, config, policy),
+            try runCompactionBenchmark(allocator, root_dir, config, policy),
+        };
 
-    try stdout.print("{s: <20} {s: >12} {s: >14} {s: >16}\n", .{ "workload", "operations", "elapsed ms", "ops/sec" });
-    for (results) |result| {
-        const elapsed_ms = @as(f64, @floatFromInt(result.elapsed_ns)) / std.time.ns_per_ms;
-        const ops_per_sec = if (result.elapsed_ns == 0)
-            0.0
-        else
-            @as(f64, @floatFromInt(result.operations)) * std.time.ns_per_s / @as(f64, @floatFromInt(result.elapsed_ns));
-        try stdout.print("{s: <20} {d: >12} {d: >14.3} {d: >16.2}\n", .{
-            workloadName(result.workload),
-            result.operations,
-            elapsed_ms,
-            ops_per_sec,
-        });
+        try stdout.print("policy: {s}\n", .{policyName(policy)});
+        try stdout.print("{s: <10} {s: <20} {s: >12} {s: >14} {s: >16}\n", .{ "policy", "workload", "operations", "elapsed ms", "ops/sec" });
+        for (results) |result| {
+            const elapsed_ms = @as(f64, @floatFromInt(result.elapsed_ns)) / std.time.ns_per_ms;
+            const ops_per_sec = if (result.elapsed_ns == 0)
+                0.0
+            else
+                @as(f64, @floatFromInt(result.operations)) * std.time.ns_per_s / @as(f64, @floatFromInt(result.elapsed_ns));
+            try stdout.print("{s: <10} {s: <20} {d: >12} {d: >14.3} {d: >16.2}\n", .{
+                policyName(result.policy),
+                workloadName(result.workload),
+                result.operations,
+                elapsed_ms,
+                ops_per_sec,
+            });
+        }
+        try stdout.print("\n", .{});
     }
     try stdout.flush();
 }
@@ -83,21 +95,37 @@ fn workloadName(workload: Workload) []const u8 {
     };
 }
 
+/// Return a readable label for each fsync policy run.
+fn policyName(policy: BenchPolicy) []const u8 {
+    return switch (policy) {
+        .always => "always",
+        .batch => "batch",
+    };
+}
+
+/// Map benchmark policy labels onto the public database option enum.
+fn fsyncPolicy(policy: BenchPolicy) kvdb.FsyncPolicy {
+    return switch (policy) {
+        .always => .always,
+        .batch => .batch,
+    };
+}
+
 /// Run inserts with sorted keys to measure append-like tree growth.
-fn runSequentialInsertBenchmark(allocator: std.mem.Allocator, root_dir: []const u8, config: DefaultConfig) !BenchResult {
-    var db = try openBenchDb(allocator, root_dir, "sequential_insert");
+fn runSequentialInsertBenchmark(allocator: std.mem.Allocator, root_dir: []const u8, config: DefaultConfig, policy: BenchPolicy) !BenchResult {
+    var db = try openBenchDb(allocator, root_dir, "sequential_insert", policy);
     defer db.close();
 
     const start = std.time.nanoTimestamp();
     try insertRange(&db, 0, config.operation_count);
     const elapsed_ns = elapsedSince(start);
 
-    return .{ .workload = .sequential_inserts, .operations = config.operation_count, .elapsed_ns = elapsed_ns };
+    return .{ .policy = policy, .workload = .sequential_inserts, .operations = config.operation_count, .elapsed_ns = elapsed_ns };
 }
 
 /// Run inserts with a deterministic shuffled key order so results stay reproducible.
-fn runRandomInsertBenchmark(allocator: std.mem.Allocator, root_dir: []const u8, config: DefaultConfig) !BenchResult {
-    var db = try openBenchDb(allocator, root_dir, "random_insert");
+fn runRandomInsertBenchmark(allocator: std.mem.Allocator, root_dir: []const u8, config: DefaultConfig, policy: BenchPolicy) !BenchResult {
+    var db = try openBenchDb(allocator, root_dir, "random_insert", policy);
     defer db.close();
 
     const ids = try allocator.alloc(usize, config.operation_count);
@@ -116,12 +144,12 @@ fn runRandomInsertBenchmark(allocator: std.mem.Allocator, root_dir: []const u8, 
     }
     const elapsed_ns = elapsedSince(start);
 
-    return .{ .workload = .random_inserts, .operations = config.operation_count, .elapsed_ns = elapsed_ns };
+    return .{ .policy = policy, .workload = .random_inserts, .operations = config.operation_count, .elapsed_ns = elapsed_ns };
 }
 
 /// Measure repeated point reads from a preloaded key space.
-fn runPointLookupBenchmark(allocator: std.mem.Allocator, root_dir: []const u8, config: DefaultConfig) !BenchResult {
-    var db = try openBenchDb(allocator, root_dir, "point_lookup");
+fn runPointLookupBenchmark(allocator: std.mem.Allocator, root_dir: []const u8, config: DefaultConfig, policy: BenchPolicy) !BenchResult {
+    var db = try openBenchDb(allocator, root_dir, "point_lookup", policy);
     defer db.close();
     try insertRange(&db, 0, config.key_space);
 
@@ -136,12 +164,12 @@ fn runPointLookupBenchmark(allocator: std.mem.Allocator, root_dir: []const u8, c
     }
     const elapsed_ns = elapsedSince(start);
 
-    return .{ .workload = .point_lookups, .operations = config.operation_count, .elapsed_ns = elapsed_ns };
+    return .{ .policy = policy, .workload = .point_lookups, .operations = config.operation_count, .elapsed_ns = elapsed_ns };
 }
 
 /// Measure full-tree iteration cost by scanning the same loaded dataset repeatedly.
-fn runScanBenchmark(allocator: std.mem.Allocator, root_dir: []const u8, config: DefaultConfig) !BenchResult {
-    var db = try openBenchDb(allocator, root_dir, "scan");
+fn runScanBenchmark(allocator: std.mem.Allocator, root_dir: []const u8, config: DefaultConfig, policy: BenchPolicy) !BenchResult {
+    var db = try openBenchDb(allocator, root_dir, "scan", policy);
     defer db.close();
     try insertRange(&db, 0, config.key_space);
 
@@ -157,12 +185,12 @@ fn runScanBenchmark(allocator: std.mem.Allocator, root_dir: []const u8, config: 
     }
     const elapsed_ns = elapsedSince(start);
 
-    return .{ .workload = .scans, .operations = config.key_space * config.scan_repetitions, .elapsed_ns = elapsed_ns };
+    return .{ .policy = policy, .workload = .scans, .operations = config.key_space * config.scan_repetitions, .elapsed_ns = elapsed_ns };
 }
 
 /// Measure overwrite-heavy traffic on an existing dataset.
-fn runUpdateBenchmark(allocator: std.mem.Allocator, root_dir: []const u8, config: DefaultConfig) !BenchResult {
-    var db = try openBenchDb(allocator, root_dir, "update");
+fn runUpdateBenchmark(allocator: std.mem.Allocator, root_dir: []const u8, config: DefaultConfig, policy: BenchPolicy) !BenchResult {
+    var db = try openBenchDb(allocator, root_dir, "update", policy);
     defer db.close();
     try insertRange(&db, 0, config.key_space);
 
@@ -172,12 +200,12 @@ fn runUpdateBenchmark(allocator: std.mem.Allocator, root_dir: []const u8, config
     }
     const elapsed_ns = elapsedSince(start);
 
-    return .{ .workload = .updates, .operations = config.operation_count, .elapsed_ns = elapsed_ns };
+    return .{ .policy = policy, .workload = .updates, .operations = config.operation_count, .elapsed_ns = elapsed_ns };
 }
 
 /// Measure deleting a deterministic prefix from a preloaded dataset.
-fn runDeleteBenchmark(allocator: std.mem.Allocator, root_dir: []const u8, config: DefaultConfig) !BenchResult {
-    var db = try openBenchDb(allocator, root_dir, "delete");
+fn runDeleteBenchmark(allocator: std.mem.Allocator, root_dir: []const u8, config: DefaultConfig, policy: BenchPolicy) !BenchResult {
+    var db = try openBenchDb(allocator, root_dir, "delete", policy);
     defer db.close();
     try insertRange(&db, 0, config.key_space);
 
@@ -188,12 +216,12 @@ fn runDeleteBenchmark(allocator: std.mem.Allocator, root_dir: []const u8, config
     }
     const elapsed_ns = elapsedSince(start);
 
-    return .{ .workload = .deletes, .operations = delete_count, .elapsed_ns = elapsed_ns };
+    return .{ .policy = policy, .workload = .deletes, .operations = delete_count, .elapsed_ns = elapsed_ns };
 }
 
 /// Measure end-to-end compaction after churn leaves dead space behind.
-fn runCompactionBenchmark(allocator: std.mem.Allocator, root_dir: []const u8, config: DefaultConfig) !BenchResult {
-    var db = try openBenchDb(allocator, root_dir, "compact");
+fn runCompactionBenchmark(allocator: std.mem.Allocator, root_dir: []const u8, config: DefaultConfig, policy: BenchPolicy) !BenchResult {
+    var db = try openBenchDb(allocator, root_dir, "compact", policy);
     defer db.close();
     try insertRange(&db, 0, config.key_space);
 
@@ -209,12 +237,12 @@ fn runCompactionBenchmark(allocator: std.mem.Allocator, root_dir: []const u8, co
     _ = try db.compact();
     const elapsed_ns = elapsedSince(start);
 
-    return .{ .workload = .compaction, .operations = 1, .elapsed_ns = elapsed_ns };
+    return .{ .policy = policy, .workload = .compaction, .operations = 1, .elapsed_ns = elapsed_ns };
 }
 
 /// Open a fresh benchmark database under the shared temp root.
-fn openBenchDb(allocator: std.mem.Allocator, root_dir: []const u8, name: []const u8) !kvdb.Database {
-    const db_path = try std.fmt.allocPrint(allocator, "{s}/{s}.db", .{ root_dir, name });
+fn openBenchDb(allocator: std.mem.Allocator, root_dir: []const u8, name: []const u8, policy: BenchPolicy) !kvdb.Database {
+    const db_path = try std.fmt.allocPrint(allocator, "{s}/{s}_{s}.db", .{ root_dir, name, policyName(policy) });
     defer allocator.free(db_path);
     const wal_path = try std.fmt.allocPrint(allocator, "{s}.wal", .{db_path});
     defer allocator.free(wal_path);
@@ -222,7 +250,7 @@ fn openBenchDb(allocator: std.mem.Allocator, root_dir: []const u8, name: []const
     std.fs.cwd().deleteFile(db_path) catch {};
     std.fs.cwd().deleteFile(wal_path) catch {};
 
-    return kvdb.Database.open(allocator, db_path, .{});
+    return kvdb.Database.open(allocator, db_path, .{ .fsync_policy = fsyncPolicy(policy) });
 }
 
 /// Insert a contiguous range of numeric keys and values.

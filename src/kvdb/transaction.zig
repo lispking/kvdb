@@ -25,8 +25,9 @@ pub const Transaction = struct {
 
     /// Commit the transaction.
     ///
-    /// This writes the commit marker, flushes dirty pages, clears any replay log,
-    /// and detaches the handle from the database.
+    /// This writes the commit marker, performs any policy-controlled WAL sync,
+    /// flushes dirty pages, clears the checkpointed WAL, and detaches the handle
+    /// from the database.
     pub fn commit(self: *Transaction) !void {
         if (self.state != .active) {
             return Error.NoActiveTransaction;
@@ -34,6 +35,7 @@ pub const Transaction = struct {
 
         if (self.db.wal) |*w| {
             try w.logCommit();
+            try w.sync();
         }
 
         try self.db.pager.flush();

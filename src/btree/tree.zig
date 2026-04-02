@@ -123,6 +123,7 @@ pub const BTree = struct {
 
         const page = try pager_ref.getPage(page_id);
         var node = BTreeNode.init(page);
+        try node.validate(pager_ref.pageCount());
 
         if (node.header.node_type == .leaf) {
             var previous_key: ?[]const u8 = null;
@@ -203,19 +204,19 @@ pub const BTree = struct {
         }
 
         const page = try pager_ref.getPage(page_id);
-        const header = pager_ref.readNodeHeader(page);
+        var node = BTreeNode.init(page);
+        try node.validate(pager_ref.pageCount());
 
-        if (header.node_type == .leaf) {
+        if (node.header.node_type == .leaf) {
             return .{
                 .tree_height = 1,
                 .node_count = 1,
                 .leaf_count = 1,
                 .internal_count = 0,
-                .entry_count = header.num_keys,
+                .entry_count = node.header.num_keys,
             };
         }
 
-        var node = BTreeNode.init(page);
         var max_child_height: usize = 0;
         var node_count: usize = 1;
         var leaf_count: usize = 0;

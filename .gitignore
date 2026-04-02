@@ -39,3 +39,5 @@ Thumbs.db
 tmp/
 temp/
 .claude/
+
+c_api_example

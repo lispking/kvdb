@@ -38,13 +38,13 @@ pub fn applyInsertNoWal(self: *Database, key: []const u8, value: []const u8) !vo
     }
     try Database.validateValue(value);
 
-    const exists = try self.contains(key);
-    if (exists) {
-        // Mirror live overwrite semantics so replay does not create duplicate keys.
-        try self.btree.delete(&self.pager, key);
-    }
-
-    try self.btree.put(&self.pager, key, value);
+    self.btree.put(&self.pager, key, value) catch |err| switch (err) {
+        Error.KeyAlreadyExists => {
+            try self.btree.update(&self.pager, key, value);
+            return;
+        },
+        else => return err,
+    };
 }
 
 /// Apply a delete directly to the tree without writing a WAL record.

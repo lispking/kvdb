@@ -32,7 +32,7 @@ const DefaultConfig = struct {
 
 /// Run a reproducible suite of storage microbenchmarks against the current engine.
 pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

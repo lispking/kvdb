@@ -225,23 +225,19 @@ pub const Database = struct {
             return Error.InvalidArgument;
         }
 
-        // Check if this is an update to existing key
-        const exists = try self.contains(key);
-
         // Log to WAL for durability
         if (self.wal) |*w| {
             try w.logInsert(key, value);
         }
 
-        if (exists) {
-            // Update existing values in place so repeated overwrites repack the
-            // leaf instead of accumulating dead payload bytes through delete+insert.
-            try self.btree.update(&self.pager, key, value);
-            return;
-        }
-
-        // Insert new key-value pair
-        try self.btree.put(&self.pager, key, value);
+        // Try insert first; if key already exists, fall back to update.
+        self.btree.put(&self.pager, key, value) catch |err| switch (err) {
+            Error.KeyAlreadyExists => {
+                try self.btree.update(&self.pager, key, value);
+                return;
+            },
+            else => return err,
+        };
     }
 
     /// Delete a key-value pair.
@@ -281,12 +277,7 @@ pub const Database = struct {
     ///
     /// Returns: true if key exists, false otherwise
     pub fn contains(self: *Database, key: []const u8) !bool {
-        const value = try self.get(key);
-        if (value) |v| {
-            self.allocator.free(v);
-            return true;
-        }
-        return false;
+        return self.btree.containsKey(&self.pager, key);
     }
 
     /// Create an iterator over all key-value pairs.

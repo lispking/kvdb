@@ -74,17 +74,17 @@ pub const Iterator = struct {
         }
 
         // Rebuild the protected payload exactly as the writer hashed it.
-        var checksum_data: std.ArrayList(u8) = .empty;
-        defer checksum_data.deinit(self.wal.allocator);
-
+        // Use stack buffer to avoid heap allocation during CRC validation.
+        var crc_buf: [4096]u8 = undefined;
+        var stream = std.io.fixedBufferStream(&crc_buf);
         const header_without_checksum = std.mem.asBytes(&header)[@sizeOf(u32)..];
-        try checksum_data.appendSlice(self.wal.allocator, header_without_checksum);
-        try checksum_data.appendSlice(self.wal.allocator, key);
+        try stream.writer().writeAll(header_without_checksum);
+        try stream.writer().writeAll(key);
         if (value) |v| {
-            try checksum_data.appendSlice(self.wal.allocator, v);
+            try stream.writer().writeAll(v);
         }
 
-        const computed_checksum = core.crc32(checksum_data.items);
+        const computed_checksum = core.crc32(stream.getWritten());
         if (computed_checksum != header.checksum) {
             return Error.WalCorrupted;
         }

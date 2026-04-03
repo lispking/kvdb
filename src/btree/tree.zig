@@ -11,6 +11,8 @@ const Error = constants.Error;
 const BTreeNode = node_mod.BTreeNode;
 const MAX_KEYS = layout.MAX_KEYS;
 const DATA_START_OFFSET = layout.DATA_START_OFFSET;
+const KeyInfo = layout.KeyInfo;
+const PAGE_SIZE = constants.PAGE_SIZE;
 
 /// B-tree index structure.
 ///
@@ -331,8 +333,31 @@ pub const BTree = struct {
         }
     }
 
+    /// Update a leaf entry in place when the new value fits the old slot.
+    /// Returns true if in-place update succeeded, false if full rebuild is needed.
+    fn tryInPlaceUpdate(node: *BTreeNode, update_index: u16, value: []const u8) bool {
+        const key_infos = node.getKeyInfoPtr();
+        const old = key_infos[update_index];
+        if (value.len > old.value_len) {
+            return false;
+        }
+
+        @memcpy(node.page.data[old.value_offset..][0..value.len], value);
+        if (value.len < old.value_len) {
+            // Zero out unused tail so stale bytes cannot be mistaken for valid data.
+            @memset(node.page.data[old.value_offset + value.len ..][0 .. old.value_len - value.len], 0);
+            key_infos[update_index].value_len = @intCast(value.len);
+        }
+        node.page.markDirty();
+        return true;
+    }
+
     /// Repack a leaf node from its current logical entries plus one replacement.
     fn rewriteLeafWithUpdatedValue(node: *BTreeNode, allocator: std.mem.Allocator, update_index: u16, value: []const u8) !void {
+        if (tryInPlaceUpdate(node, update_index, value)) {
+            return;
+        }
+
         var entries: std.ArrayList(LeafEntry) = .empty;
         try entries.ensureTotalCapacity(allocator, node.header.num_keys);
         defer freeLeafEntries(allocator, &entries);
@@ -505,17 +530,58 @@ pub const BTree = struct {
     }
 
     /// Insert a promoted separator into an internal node that still has room.
-    fn insertIntoInternal(self: *BTree, node: *BTreeNode, pager_ref: *Pager, child_index: usize, key: []const u8, right_child_id: PageId) !void {
-        _ = self;
+    /// Performs the insert in-place on the page without heap allocations.
+    fn insertIntoInternal(node: *BTreeNode, pager_ref: *Pager, child_index: usize, key: []const u8, right_child_id: PageId) !void {
+        _ = pager_ref;
 
-        var keys: std.ArrayList([]u8) = .empty;
-        defer freeOwnedKeys(pager_ref.allocator, &keys);
-        var child_ids: std.ArrayList(PageId) = .empty;
-        defer child_ids.deinit(pager_ref.allocator);
+        const num_keys: usize = node.header.num_keys;
+        const key_infos = node.getKeyInfoPtr();
 
-        try collectInternalState(node, pager_ref.allocator, &keys, &child_ids);
-        try insertInternalState(&keys, &child_ids, pager_ref.allocator, child_index, key, right_child_id);
-        try writeInternalNode(node, keys.items, child_ids.items);
+        // Compute source ranges for KeyInfo memmove.
+        const src_count = num_keys - child_index;
+        if (src_count > 0) {
+            // Shift entries after insert position right by one.
+            std.mem.copyBackwards(KeyInfo, key_infos[child_index + 1 .. num_keys + 1], key_infos[child_index..][0..src_count]);
+        }
+
+        // Find free space in the key data area.
+        var max_offset: usize = DATA_START_OFFSET;
+        var i: usize = 0;
+        while (i <= num_keys) : (i += 1) {
+            const end = key_infos[i].key_offset + key_infos[i].key_len;
+            if (end > max_offset) max_offset = end;
+        }
+
+        const child_area_offset = PAGE_SIZE - @sizeOf(PageId) * (MAX_KEYS + 1);
+        if (max_offset + key.len > child_area_offset) {
+            return Error.PageOverflow;
+        }
+
+        // Write new key data.
+        @memcpy(node.page.data[max_offset..][0..key.len], key);
+
+        // Write new KeyInfo entry.
+        key_infos[child_index] = .{
+            .key_offset = @intCast(max_offset),
+            .key_len = @intCast(key.len),
+            .value_offset = @intCast(max_offset + key.len),
+            .value_len = 0,
+        };
+
+        // Shift child pointers after insert position.
+        const child_count = num_keys + 1;
+        var child_src = child_count;
+        var child_dst: u16 = @intCast(child_count + 1);
+        while (child_src > child_index) {
+            child_dst -= 1;
+            child_src -= 1;
+            const cid = node.getChildPageId(@intCast(child_src));
+            node.setChildPageId(child_dst, cid);
+        }
+        node.setChildPageId(@intCast(child_index + 1), right_child_id);
+
+        node.header.num_keys += 1;
+        node.saveHeader();
     }
 
     /// Promote a split root into a fresh internal root that keeps the root page ID.
@@ -532,7 +598,6 @@ pub const BTree = struct {
         // Rewrite the original root page in place so metadata can keep pointing
         // at the same root page ID even after the tree gains a new level.
         try writeInternalNode(&root_node, root_keys[0..], root_children[0..]);
-        try self.normalizeInternalSeparators(&root_node, pager_ref);
     }
 
     /// Recursive helper for key lookup.
@@ -607,21 +672,14 @@ pub const BTree = struct {
 
         if (child_split) |split| {
             if (!node.isFull()) {
-                try self.insertIntoInternal(&node, pager_ref, child_index, split.key(), split.right_page_id);
-                try self.normalizeInternalSeparators(&node, pager_ref);
+                try insertIntoInternal(&node, pager_ref, child_index, split.key(), split.right_page_id);
                 return null;
             }
 
             const node_split = try self.splitInternalAndInsert(&node, pager_ref, child_index, split.key(), split.right_page_id);
-            try self.normalizeInternalSeparators(&node, pager_ref);
-            var right_node = BTreeNode.init(try pager_ref.getPage(node_split.right_page_id));
-            try self.normalizeInternalSeparators(&right_node, pager_ref);
             return node_split;
         }
 
-        // Even without a structural split, a child may have gained a new minimum
-        // key, so parent separators must be refreshed after the recursive insert.
-        try self.normalizeInternalSeparators(&node, pager_ref);
         return null;
     }
 
@@ -652,6 +710,23 @@ pub const BTree = struct {
         const child_index = if (result.found) result.index + 1 else result.index;
         try self.deleteRecursive(pager_ref, node.getChildPageId(child_index), key);
         try self.normalizeInternalSeparators(&node, pager_ref);
+    }
+
+    /// Check if a key exists without allocating a value buffer.
+    pub fn containsKey(self: *BTree, pager_ref: *Pager, key: []const u8) !bool {
+        var page_id = self.root_page_id;
+        while (true) {
+            const page = try pager_ref.getPage(page_id);
+            var node = BTreeNode.init(page);
+            const result = node.findKey(key);
+
+            if (node.header.node_type == .leaf) {
+                return result.found;
+            }
+
+            const child_index = if (result.found) result.index + 1 else result.index;
+            page_id = node.getChildPageId(child_index);
+        }
     }
 
     /// Public interface for key lookup.

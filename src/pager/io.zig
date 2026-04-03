@@ -126,10 +126,9 @@ pub const Pager = struct {
 
         const page = try cache.ensureCachedPage(self, page_id);
         const offset = page_id * self.page_size;
-        try self.file.seekTo(offset);
 
         var buf: [PAGE_SIZE]u8 = undefined;
-        const bytes_read = try self.file.read(&buf);
+        const bytes_read = try self.file.pread(&buf, offset);
 
         if (bytes_read == 0) {
             @memset(&page.data, 0);

@@ -110,42 +110,34 @@ pub const Wal = struct {
 
         // Build header with placeholder checksum
         var header = WalRecordHeader{
-            .checksum = 0, // Will be computed below
+            .checksum = 0,
             .record_type = record_type,
             .key_len = @intCast(key.len),
             .value_len = value_len,
         };
 
-        // Serialize header and data for checksum calculation
-        // We exclude the checksum field itself from the checksum
-        const header_bytes = std.mem.asBytes(&header);
-        var checksum_data: std.ArrayList(u8) = .empty;
-        defer checksum_data.deinit(self.allocator);
-
-        // Add header content (skipping checksum field)
-        try checksum_data.appendSlice(self.allocator, header_bytes[@sizeOf(u32)..]);
-        try checksum_data.appendSlice(self.allocator, key);
+        // Compute CRC32 using stack buffer (no heap allocation).
+        // Max record: sizeof(header_without_checksum)=11 + MAX_KEY_SIZE(1024) + MAX_VALUE_SIZE(2048) = 3083
+        var record_buf: [4096]u8 = undefined;
+        const header_without_checksum = std.mem.asBytes(&header)[@sizeOf(u32)..];
+        var stream = std.io.fixedBufferStream(&record_buf);
+        try stream.writer().writeAll(header_without_checksum);
+        try stream.writer().writeAll(key);
         if (value) |v| {
-            try checksum_data.appendSlice(self.allocator, v);
+            try stream.writer().writeAll(v);
+        }
+        header.checksum = crc32(stream.getWritten());
+
+        // Serialize full record into the stack buffer and write in one syscall.
+        var full_stream = std.io.fixedBufferStream(&record_buf);
+        const w = full_stream.writer();
+        try w.writeAll(std.mem.asBytes(&header));
+        try w.writeAll(key);
+        if (value) |v| {
+            try w.writeAll(v);
         }
 
-        // Compute and store checksum
-        header.checksum = crc32(checksum_data.items);
-
-        // Write record to WAL file
-        try self.file.seekFromEnd(0);
-
-        // Write header with actual checksum
-        const final_header_bytes = std.mem.asBytes(&header);
-        try self.file.writeAll(final_header_bytes);
-
-        // Write key
-        try self.file.writeAll(key);
-
-        // Write value (if present)
-        if (value) |v| {
-            try self.file.writeAll(v);
-        }
+        try self.file.writeAll(full_stream.getWritten());
 
         // Update offset tracking
         self.current_offset += @sizeOf(WalRecordHeader) + key.len + value_len;

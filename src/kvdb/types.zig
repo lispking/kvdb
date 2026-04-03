@@ -25,4 +25,8 @@ pub const Options = struct {
     enable_wal: bool = true,
     /// Choose whether commit/checkpoint paths force data to stable storage.
     fsync_policy: FsyncPolicy = .always,
+    /// Maximum number of pages kept in the in-memory cache.
+    /// Larger values reduce disk I/O at the cost of higher memory usage.
+    /// Defaults to 256.
+    page_cache_size: usize = 256,
 };

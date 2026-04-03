@@ -8,13 +8,17 @@ const Pager = pager.Pager;
 const PageId = constants.PageId;
 const INVALID_PAGE_ID = constants.INVALID_PAGE_ID;
 
+fn initTestPager(allocator: std.mem.Allocator, path: []const u8, fsync_policy: anytype) !pager.Pager {
+    return pager.Pager.init(allocator, path, fsync_policy, PAGE_CACHE_LIMIT);
+}
+
 test "pager: basic operations" {
     const allocator = std.testing.allocator;
     const test_path = "test_pager.db";
     defer std.fs.cwd().deleteFile(test_path) catch {};
 
     {
-        var p = try Pager.init(allocator, test_path, .always);
+        var p = try initTestPager(allocator, test_path, .always);
         defer p.deinit();
 
         try std.testing.expectEqual(@as(PageId, 2), p.pageCount());
@@ -29,7 +33,7 @@ test "pager: basic operations" {
     }
 
     {
-        var p = try Pager.init(allocator, test_path, .always);
+        var p = try initTestPager(allocator, test_path, .always);
         defer p.deinit();
 
         try std.testing.expectEqual(@as(PageId, 3), p.pageCount());
@@ -42,7 +46,7 @@ test "pager: freed pages are reused before file growth" {
     defer std.fs.cwd().deleteFile(test_path) catch {};
 
     {
-        var p = try Pager.init(allocator, test_path, .always);
+        var p = try initTestPager(allocator, test_path, .always);
         defer p.deinit();
 
         const first = try p.allocatePage();
@@ -66,7 +70,7 @@ test "pager: cache lookup returns same page instance" {
     const test_path = "test_pager_cache_lookup.db";
     defer std.fs.cwd().deleteFile(test_path) catch {};
 
-    var p = try Pager.init(allocator, test_path, .always);
+    var p = try initTestPager(allocator, test_path, .always);
     defer p.deinit();
 
     const first = try p.getPage(constants.ROOT_PAGE_ID);
@@ -81,7 +85,7 @@ test "pager: flush prunes clean cache entries to configured limit" {
     const test_path = "test_pager_cache_prune.db";
     defer std.fs.cwd().deleteFile(test_path) catch {};
 
-    var p = try Pager.init(allocator, test_path, .always);
+    var p = try initTestPager(allocator, test_path, .always);
     defer p.deinit();
 
     var pages: [PAGE_CACHE_LIMIT + 4]*Page = undefined;
@@ -106,7 +110,7 @@ test "pager: flush keeps dirty pages resident until they become clean" {
     const test_path = "test_pager_cache_dirty.db";
     defer std.fs.cwd().deleteFile(test_path) catch {};
 
-    var p = try Pager.init(allocator, test_path, .always);
+    var p = try initTestPager(allocator, test_path, .always);
     defer p.deinit();
 
     var pages: [PAGE_CACHE_LIMIT + 4]*Page = undefined;
@@ -136,7 +140,7 @@ test "pager: flush keeps reserved pages resident" {
     const test_path = "test_pager_cache_reserved.db";
     defer std.fs.cwd().deleteFile(test_path) catch {};
 
-    var p = try Pager.init(allocator, test_path, .always);
+    var p = try initTestPager(allocator, test_path, .always);
     defer p.deinit();
 
     const meta_page = try p.getPage(constants.META_PAGE_ID);
@@ -159,7 +163,7 @@ test "pager: freelist survives reopen" {
     defer std.fs.cwd().deleteFile(test_path) catch {};
 
     {
-        var p = try Pager.init(allocator, test_path, .always);
+        var p = try initTestPager(allocator, test_path, .always);
         defer p.deinit();
 
         const reusable = try p.allocatePage();
@@ -169,7 +173,7 @@ test "pager: freelist survives reopen" {
     }
 
     {
-        var p = try Pager.init(allocator, test_path, .always);
+        var p = try initTestPager(allocator, test_path, .always);
         defer p.deinit();
 
         const recycled = try p.allocatePage();

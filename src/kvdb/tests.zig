@@ -16,6 +16,276 @@ const kvdb_delete = root.kvdb_delete;
 const PageId = constants.PageId;
 const ROOT_PAGE_ID = constants.ROOT_PAGE_ID;
 
+test "kvdb: benchmark random insert path stays correct with heap-allocated id slice" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const root_dir = "/tmp/kvdb_bench_exact";
+    const db_path = "/tmp/kvdb_bench_exact/random_insert_always.db";
+    const wal_path = "/tmp/kvdb_bench_exact/random_insert_always.db.wal";
+
+    std.fs.makeDirAbsolute(root_dir) catch {};
+    std.fs.deleteFileAbsolute(db_path) catch {};
+    std.fs.deleteFileAbsolute(wal_path) catch {};
+    defer std.fs.deleteFileAbsolute(db_path) catch {};
+    defer std.fs.deleteFileAbsolute(wal_path) catch {};
+
+    var db = try Database.open(allocator, db_path, .{ .fsync_policy = .always });
+    defer db.close();
+
+    const ids = try allocator.alloc(usize, 10_000);
+    defer allocator.free(ids);
+    for (ids, 0..) |*slot, i| {
+        slot.* = i;
+    }
+
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const random = prng.random();
+    random.shuffle(usize, ids);
+
+    for (ids, 0..) |id, insert_index| {
+        var key_buf: [32]u8 = undefined;
+        var value_buf: [48]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "bench-key-{d:0>8}", .{id});
+        const value = try std.fmt.bufPrint(&value_buf, "bench-value-{d:0>12}", .{id});
+        try db.put(key, value);
+
+        if ((insert_index + 1) % 250 == 0) {
+            _ = try db.verify();
+        }
+    }
+
+    const stats = try db.inspect();
+    try std.testing.expect(stats.tree_height >= 3);
+    try std.testing.expectEqual(@as(usize, 10_000), stats.entry_count);
+}
+
+test "kvdb: benchmark sequential then random workloads stay correct in one process" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const root_dir = "/tmp/kvdb_bench_process";
+
+    std.fs.makeDirAbsolute(root_dir) catch {};
+
+    const Config = struct {
+        operation_count: usize = 10_000,
+        key_space: usize = 10_000,
+        seed: u64 = 0xC0FFEE,
+    };
+    const config = Config{};
+
+    const policies = [_]root.FsyncPolicy{ .always, .batch };
+    for (policies) |policy| {
+        {
+            const db_path = try std.fmt.allocPrint(allocator, "{s}/sequential_insert_{s}.db", .{ root_dir, @tagName(policy) });
+            defer allocator.free(db_path);
+            const wal_path = try std.fmt.allocPrint(allocator, "{s}.wal", .{db_path});
+            defer allocator.free(wal_path);
+
+            std.fs.deleteFileAbsolute(db_path) catch {};
+            std.fs.deleteFileAbsolute(wal_path) catch {};
+            defer std.fs.deleteFileAbsolute(db_path) catch {};
+            defer std.fs.deleteFileAbsolute(wal_path) catch {};
+
+            var db = try Database.open(allocator, db_path, .{ .fsync_policy = policy });
+            defer db.close();
+
+            if (policy == .batch) {
+                var txn = try db.beginTransaction();
+                for (0..config.operation_count) |id| {
+                    var key_buf: [32]u8 = undefined;
+                    var value_buf: [48]u8 = undefined;
+                    const key = try std.fmt.bufPrint(&key_buf, "bench-key-{d:0>8}", .{id});
+                    const value = try std.fmt.bufPrint(&value_buf, "bench-value-{d:0>12}", .{id});
+                    try db.put(key, value);
+                }
+                try txn.commit();
+            } else {
+                for (0..config.operation_count) |id| {
+                    var key_buf: [32]u8 = undefined;
+                    var value_buf: [48]u8 = undefined;
+                    const key = try std.fmt.bufPrint(&key_buf, "bench-key-{d:0>8}", .{id});
+                    const value = try std.fmt.bufPrint(&value_buf, "bench-value-{d:0>12}", .{id});
+                    try db.put(key, value);
+                }
+            }
+        }
+
+        {
+            const db_path = try std.fmt.allocPrint(allocator, "{s}/random_insert_{s}.db", .{ root_dir, @tagName(policy) });
+            defer allocator.free(db_path);
+            const wal_path = try std.fmt.allocPrint(allocator, "{s}.wal", .{db_path});
+            defer allocator.free(wal_path);
+
+            std.fs.deleteFileAbsolute(db_path) catch {};
+            std.fs.deleteFileAbsolute(wal_path) catch {};
+            defer std.fs.deleteFileAbsolute(db_path) catch {};
+            defer std.fs.deleteFileAbsolute(wal_path) catch {};
+
+            var db = try Database.open(allocator, db_path, .{ .fsync_policy = policy });
+            defer db.close();
+
+            var ids: [10000]usize = undefined;
+            for (&ids, 0..) |*slot, i| {
+                slot.* = i;
+            }
+            var prng = std.Random.DefaultPrng.init(config.seed);
+            prng.random().shuffle(usize, &ids);
+
+            for (ids) |id| {
+                var key_buf: [32]u8 = undefined;
+                var value_buf: [48]u8 = undefined;
+                const key = try std.fmt.bufPrint(&key_buf, "bench-key-{d:0>8}", .{id});
+                const value = try std.fmt.bufPrint(&value_buf, "bench-value-{d:0>12}", .{id});
+                try db.put(key, value);
+            }
+
+            const stats = try db.inspect();
+            try std.testing.expect(stats.tree_height >= 3);
+            try std.testing.expectEqual(config.operation_count, stats.entry_count);
+            _ = try db.verify();
+        }
+    }
+}
+
+test "kvdb: benchmark workload sequence stays correct" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const root_dir = "/tmp/kvdb_bench_sequence";
+
+    std.fs.makeDirAbsolute(root_dir) catch {};
+
+    const Config = struct {
+        operation_count: usize = 10_000,
+        key_space: usize = 10_000,
+        seed: u64 = 0xC0FFEE,
+    };
+    const config = Config{};
+
+    const policies = [_]root.FsyncPolicy{ .always, .batch };
+    for (policies) |policy| {
+        const db_path = try std.fmt.allocPrint(allocator, "{s}/random_insert_{s}.db", .{ root_dir, @tagName(policy) });
+        defer allocator.free(db_path);
+        const wal_path = try std.fmt.allocPrint(allocator, "{s}.wal", .{db_path});
+        defer allocator.free(wal_path);
+
+        std.fs.deleteFileAbsolute(db_path) catch {};
+        std.fs.deleteFileAbsolute(wal_path) catch {};
+        defer std.fs.deleteFileAbsolute(db_path) catch {};
+        defer std.fs.deleteFileAbsolute(wal_path) catch {};
+
+        var db = try Database.open(allocator, db_path, .{ .fsync_policy = policy });
+        defer db.close();
+
+        var ids: [10000]usize = undefined;
+        for (&ids, 0..) |*slot, i| {
+            slot.* = i;
+        }
+        var prng = std.Random.DefaultPrng.init(config.seed);
+        prng.random().shuffle(usize, &ids);
+
+        for (ids) |id| {
+            var key_buf: [32]u8 = undefined;
+            var value_buf: [48]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buf, "bench-key-{d:0>8}", .{id});
+            const value = try std.fmt.bufPrint(&value_buf, "bench-value-{d:0>12}", .{id});
+            try db.put(key, value);
+        }
+
+        const stats = try db.inspect();
+        try std.testing.expect(stats.tree_height >= 3);
+        try std.testing.expectEqual(config.operation_count, stats.entry_count);
+        _ = try db.verify();
+    }
+}
+
+test "kvdb: benchmark-style random insert workload stays correct with gpa and absolute path" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const test_path = "/tmp/test_kvdb_benchmark_random_insert.db";
+    const wal_path = "/tmp/test_kvdb_benchmark_random_insert.db.wal";
+
+    std.fs.deleteFileAbsolute(test_path) catch {};
+    std.fs.deleteFileAbsolute(wal_path) catch {};
+    defer std.fs.deleteFileAbsolute(test_path) catch {};
+    defer std.fs.deleteFileAbsolute(wal_path) catch {};
+
+    var db = try Database.open(allocator, test_path, .{});
+    defer db.close();
+
+    var ids: [10000]usize = undefined;
+    for (&ids, 0..) |*slot, i| {
+        slot.* = i;
+    }
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    prng.random().shuffle(usize, &ids);
+
+    for (ids, 0..) |id, insert_index| {
+        var key_buf: [32]u8 = undefined;
+        var value_buf: [48]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "bench-key-{d:0>8}", .{id});
+        const value = try std.fmt.bufPrint(&value_buf, "bench-value-{d:0>12}", .{id});
+        try db.put(key, value);
+
+        if ((insert_index + 1) % 250 == 0) {
+            _ = try db.verify();
+        }
+    }
+
+    const stats = try db.inspect();
+    try std.testing.expect(stats.tree_height >= 3);
+    try std.testing.expectEqual(@as(usize, 10000), stats.entry_count);
+}
+
+test "kvdb: large random insert workload stays correct" {
+    const allocator = std.testing.allocator;
+    const test_path = "test_kvdb_large_random_insert.db";
+
+    defer std.fs.cwd().deleteFile(test_path) catch {};
+    defer std.fs.cwd().deleteFile("test_kvdb_large_random_insert.db.wal") catch {};
+
+    var db = try Database.open(allocator, test_path, .{ .page_cache_size = 32 });
+    defer db.close();
+
+    var ids: [10000]usize = undefined;
+    for (&ids, 0..) |*slot, i| {
+        slot.* = i;
+    }
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    prng.random().shuffle(usize, &ids);
+
+    for (ids, 0..) |id, insert_index| {
+        var key_buf: [32]u8 = undefined;
+        var value_buf: [48]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "bench-key-{d:0>8}", .{id});
+        const value = try std.fmt.bufPrint(&value_buf, "bench-value-{d:0>12}", .{id});
+        try db.put(key, value);
+
+        if ((insert_index + 1) % 250 == 0) {
+            _ = try db.verify();
+        }
+    }
+
+    const stats = try db.inspect();
+    try std.testing.expect(stats.tree_height >= 3);
+    try std.testing.expectEqual(@as(usize, 10000), stats.entry_count);
+    _ = try db.verify();
+
+    for (0..10000) |id| {
+        var key_buf: [32]u8 = undefined;
+        var expected_value_buf: [48]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "bench-key-{d:0>8}", .{id});
+        const expected_value = try std.fmt.bufPrint(&expected_value_buf, "bench-value-{d:0>12}", .{id});
+        const value = try db.get(key);
+        try std.testing.expect(value != null);
+        try std.testing.expectEqualStrings(expected_value, value.?);
+        allocator.free(value.?);
+    }
+}
+
 test "kvdb: verify reports corrupted node page" {
     const allocator = std.testing.allocator;
     const test_path = "test_kvdb_verify_corrupt_node.db";

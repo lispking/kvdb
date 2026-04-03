@@ -117,7 +117,13 @@ fn runSequentialInsertBenchmark(allocator: std.mem.Allocator, root_dir: []const 
     defer db.close();
 
     const start = std.time.nanoTimestamp();
-    try insertRange(&db, 0, config.operation_count);
+    if (policy == .batch) {
+        var txn = try db.beginTransaction();
+        try insertRange(&db, 0, config.operation_count);
+        try txn.commit();
+    } else {
+        try insertRange(&db, 0, config.operation_count);
+    }
     const elapsed_ns = elapsedSince(start);
 
     return .{ .policy = policy, .workload = .sequential_inserts, .operations = config.operation_count, .elapsed_ns = elapsed_ns };
@@ -247,8 +253,13 @@ fn openBenchDb(allocator: std.mem.Allocator, root_dir: []const u8, name: []const
     const wal_path = try std.fmt.allocPrint(allocator, "{s}.wal", .{db_path});
     defer allocator.free(wal_path);
 
-    std.fs.cwd().deleteFile(db_path) catch {};
-    std.fs.cwd().deleteFile(wal_path) catch {};
+    if (std.fs.path.isAbsolute(db_path)) {
+        std.fs.deleteFileAbsolute(db_path) catch {};
+        std.fs.deleteFileAbsolute(wal_path) catch {};
+    } else {
+        std.fs.cwd().deleteFile(db_path) catch {};
+        std.fs.cwd().deleteFile(wal_path) catch {};
+    }
 
     return kvdb.Database.open(allocator, db_path, .{ .fsync_policy = fsyncPolicy(policy) });
 }

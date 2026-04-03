@@ -6,6 +6,7 @@ const transaction_mod = @import("kvdb/transaction.zig");
 const ffi = @import("kvdb/ffi.zig");
 const database_mod = @import("kvdb/database.zig");
 const _tests = @import("kvdb/tests.zig");
+const _bloom = @import("bloom.zig");
 
 pub const Error = constants.Error;
 /// Stable C ABI status enum shared by the exported FFI entry points.
@@ -24,6 +25,8 @@ pub const VerifyStats = maintenance.VerifyStats;
 pub const InspectStats = maintenance.InspectStats;
 /// Main database API type.
 pub const Database = database_mod.Database;
+/// Bloom filter for fast negative membership testing.
+pub const BloomFilter = _bloom.BloomFilter;
 
 /// Exported C ABI entry point for opening a database handle.
 pub export fn kvdb_open(path: [*c]const u8, path_len: usize) ?KVDB_Handle {

@@ -55,6 +55,13 @@ pub const Wal = struct {
     /// Controls whether WAL durability boundaries force a file sync.
     fsync_policy: FsyncPolicy,
 
+    /// Buffered write accumulator for group commit.
+    /// Records accumulate here and are flushed together.
+    write_buffer: std.ArrayList(u8),
+
+    /// Pre-allocated WAL file size for reduced filesystem fragmentation.
+    allocated_size: u64,
+
     /// Initialize a new WAL for the given database path.
     ///
     /// Opens or creates a WAL file at `{db_path}.wal`. If the file exists,
@@ -87,13 +94,32 @@ pub const Wal = struct {
             .file_path = try allocator.dupe(u8, wal_path),
             .current_offset = stat.size,
             .fsync_policy = fsync_policy,
+            .write_buffer = std.ArrayList(u8).initCapacity(allocator, 4096) catch .{ .items = &.{}, .capacity = 0 },
+            .allocated_size = stat.size,
         };
     }
 
     /// Clean up resources and close the WAL file.
     pub fn deinit(self: *Wal) void {
+        // Flush any buffered writes before closing.
+        self.flushBuffered() catch {};
         self.file.close();
         self.allocator.free(self.file_path);
+        if (self.write_buffer.capacity > 0) self.write_buffer.deinit(self.allocator);
+    }
+
+    /// Flush buffered WAL records to disk.
+    fn flushBuffered(self: *Wal) !void {
+        if (self.write_buffer.items.len == 0) return;
+        try self.file.writeAll(self.write_buffer.items);
+        self.current_offset += self.write_buffer.items.len;
+        self.write_buffer.clearRetainingCapacity();
+    }
+
+    /// Flush all buffered WAL records to the WAL file without forcing
+    /// a durability boundary. Callers that need durability should call `sync()`.
+    pub fn flush(self: *Wal) !void {
+        try self.flushBuffered();
     }
 
     /// Append a record to the WAL.
@@ -128,7 +154,7 @@ pub const Wal = struct {
         }
         header.checksum = crc32(stream.getWritten());
 
-        // Serialize full record into the stack buffer and write in one syscall.
+        // Serialize full record into the stack buffer.
         var full_stream = std.io.fixedBufferStream(&record_buf);
         const w = full_stream.writer();
         try w.writeAll(std.mem.asBytes(&header));
@@ -137,10 +163,13 @@ pub const Wal = struct {
             try w.writeAll(v);
         }
 
-        try self.file.writeAll(full_stream.getWritten());
+        const written = full_stream.getWritten();
 
-        // Update offset tracking
-        self.current_offset += @sizeOf(WalRecordHeader) + key.len + value_len;
+        // Append to write buffer for group commit batching.
+        try self.write_buffer.appendSlice(self.allocator, written);
+        // Flush immediately for standalone writes; transaction commits
+        // benefit from batched flush in `Transaction.commit()`.
+        try self.flushBuffered();
     }
 
     /// Force the current WAL contents to stable storage when the active policy

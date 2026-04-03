@@ -7,7 +7,7 @@ pub const PageId = constants.PageId;
 
 /// Flush-time pruning keeps cache growth bounded without evicting pages while
 /// callers may still hold raw `*Page` pointers during tree traversal.
-pub const PAGE_CACHE_LIMIT: usize = 32;
+pub const PAGE_CACHE_LIMIT: usize = 256;
 
 /// Header stored inside pages that have been returned to the freelist.
 pub const FreePageHeader = packed struct {

@@ -27,7 +27,9 @@ pub const HEADER_SIZE = @sizeOf(NodeHeader);
 /// Size of each KeyInfo entry in bytes
 pub const KEY_INFO_SIZE = @sizeOf(KeyInfo);
 
-/// Maximum number of key-value pairs per node
+/// Maximum number of key-value pairs per node.
+/// Limited by page layout: each entry needs 8 bytes KeyInfo plus key+value data.
+/// For 4KB pages with ~40-byte entries, 64 provides good fanout while leaving room.
 pub const MAX_KEYS: u16 = 64;
 
 /// Offset where key/value data starts (after header and all KeyInfo slots)

@@ -213,6 +213,35 @@ pub const BTreeNode = struct {
         self.page.markDirty();
     }
 
+    /// Update the key at `index` in-place. Only works if the new key fits
+    /// within the existing key's space. For the borrow case, the new key
+    /// (sibling's rightmost) is typically similar in length.
+    pub fn updateKey(self: *BTreeNode, index: u16, new_key: []const u8) !void {
+        const key_infos = self.getKeyInfoPtr();
+        const old = key_infos[index];
+        if (new_key.len > old.key_len) {
+            // Fall back to appending new key data.
+            const offset = self.getNextDataOffset();
+            const child_area_offset = PAGE_SIZE - @sizeOf(PageId) * (MAX_KEYS + 1);
+            if (offset + new_key.len > child_area_offset) {
+                return Error.PageOverflow;
+            }
+            @memcpy(self.page.data[offset..][0..new_key.len], new_key);
+            key_infos[index] = .{
+                .key_offset = @intCast(offset),
+                .key_len = @intCast(new_key.len),
+                .value_offset = old.value_offset,
+                .value_len = old.value_len,
+            };
+        } else {
+            @memcpy(self.page.data[old.key_offset..][0..new_key.len], new_key);
+            // Zero out unused tail.
+            @memset(self.page.data[old.key_offset + new_key.len ..][0 .. old.key_len - new_key.len], 0);
+            key_infos[index].key_len = @intCast(new_key.len);
+        }
+        self.page.markDirty();
+    }
+
     /// Retrieve a key-value pair by index.
     ///
     /// Copies the key and value data into the provided buffers.

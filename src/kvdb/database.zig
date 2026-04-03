@@ -69,7 +69,7 @@ pub const Database = struct {
     /// Returns: Initialized Database ready for use
     pub fn open(allocator: std.mem.Allocator, path: []const u8, options: Options) !Database {
         // Initialize pager which handles all page I/O
-        var p = try Pager.init(allocator, path, options.fsync_policy);
+        var p = try Pager.init(allocator, path, options.fsync_policy, options.page_cache_size);
         var pager_owned = true;
         errdefer if (pager_owned) p.deinit();
 
@@ -151,7 +151,7 @@ pub const Database = struct {
 
         // Close and reopen pager to discard in-memory changes
         self.pager.deinit();
-        self.pager = try Pager.init(self.allocator, self.db_path, self.options.fsync_policy);
+        self.pager = try Pager.init(self.allocator, self.db_path, self.options.fsync_policy, self.options.page_cache_size);
 
         // Restore WAL
         self.wal = wal_instance;

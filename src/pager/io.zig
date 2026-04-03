@@ -55,7 +55,7 @@ pub const Pager = struct {
     next_page_id: PageId,
 
     /// Initialize a new Pager for the database file at the given path.
-    pub fn init(allocator: std.mem.Allocator, file_path: []const u8, fsync_policy: FsyncPolicy) !Pager {
+    pub fn init(allocator: std.mem.Allocator, file_path: []const u8, fsync_policy: FsyncPolicy, page_cache_size: usize) !Pager {
         const file = try std.fs.cwd().createFile(file_path, .{
             .read = true,
             .truncate = false,
@@ -76,7 +76,7 @@ pub const Pager = struct {
             .page_size = PAGE_SIZE,
             .cache = cache_list,
             .cache_index = cache_index,
-            .cache_limit = PAGE_CACHE_LIMIT,
+            .cache_limit = page_cache_size,
             .fsync_policy = fsync_policy,
             .next_page_id = if (file_size == 0) 0 else @intCast(file_size / PAGE_SIZE),
         };

@@ -544,10 +544,12 @@ pub const BTree = struct {
             std.mem.copyBackwards(KeyInfo, key_infos[child_index + 1 .. num_keys + 1], key_infos[child_index..][0..src_count]);
         }
 
-        // Find free space in the key data area.
+        // Find free space in the current key data area using only the
+        // original valid entries. The slot at `num_keys` is newly opened by
+        // the shift above and does not contain valid metadata yet.
         var max_offset: usize = DATA_START_OFFSET;
         var i: usize = 0;
-        while (i <= num_keys) : (i += 1) {
+        while (i < num_keys) : (i += 1) {
             const end = key_infos[i].key_offset + key_infos[i].key_len;
             if (end > max_offset) max_offset = end;
         }
@@ -683,32 +685,317 @@ pub const BTree = struct {
         return null;
     }
 
-    /// Recursive helper for delete without rebalancing.
-    ///
-    /// This follows the same separator-routing rules as lookup and insert, but
-    /// rejects deletes that would empty a non-root leaf because borrow/merge and
-    /// root-shrink behavior are not implemented yet.
+    /// Merge two child pages and the separator into the left child.
+    /// After merge, the right child page is freed.
+    fn mergeChildren(self: *BTree, pager_ref: *Pager, parent_node: *BTreeNode, left_child_idx: u16, parent_page_id: PageId) !void {
+        const left_page_id = parent_node.getChildPageId(left_child_idx);
+        const right_page_id = parent_node.getChildPageId(left_child_idx + 1);
+
+        const left_page = try pager_ref.getPage(left_page_id);
+        const right_page = try pager_ref.getPage(right_page_id);
+        var left_child = BTreeNode.init(left_page);
+        var right_child = BTreeNode.init(right_page);
+
+        const separator_key = getKey(parent_node, left_child_idx);
+
+        if (left_child.header.node_type == .leaf) {
+            // Merge right leaf into left leaf.
+            // Collect all entries from left child, separator, and right child.
+            var entries: std.ArrayList(LeafEntry) = .empty;
+            try entries.ensureTotalCapacity(pager_ref.allocator, left_child.header.num_keys + 1 + right_child.header.num_keys);
+            defer freeLeafEntries(pager_ref.allocator, &entries);
+
+            for (0..left_child.header.num_keys) |i| {
+                try entries.append(pager_ref.allocator, .{
+                    .key = try pager_ref.allocator.dupe(u8, getKey(&left_child, @intCast(i))),
+                    .value = try pager_ref.allocator.dupe(u8, getValue(&left_child, @intCast(i))),
+                });
+            }
+            try entries.append(pager_ref.allocator, .{
+                .key = try pager_ref.allocator.dupe(u8, separator_key),
+                .value = try pager_ref.allocator.dupe(u8, &.{}),
+            });
+            for (0..right_child.header.num_keys) |i| {
+                try entries.append(pager_ref.allocator, .{
+                    .key = try pager_ref.allocator.dupe(u8, getKey(&right_child, @intCast(i))),
+                    .value = try pager_ref.allocator.dupe(u8, getValue(&right_child, @intCast(i))),
+                });
+            }
+
+            try writeLeafNode(&left_child, entries.items);
+        } else {
+            // Merge two internal nodes with separator.
+            var keys: std.ArrayList([]u8) = .empty;
+            defer freeOwnedKeys(pager_ref.allocator, &keys);
+            var child_ids: std.ArrayList(PageId) = .empty;
+            defer child_ids.deinit(pager_ref.allocator);
+
+            // Collect left child's state
+            try collectInternalState(&left_child, pager_ref.allocator, &keys, &child_ids);
+            // Add separator
+            try keys.append(pager_ref.allocator, try pager_ref.allocator.dupe(u8, separator_key));
+            try child_ids.append(pager_ref.allocator, right_page_id);
+            // Add right child's state
+            var right_keys: std.ArrayList([]u8) = .empty;
+            defer freeOwnedKeys(pager_ref.allocator, &right_keys);
+            var right_child_ids: std.ArrayList(PageId) = .empty;
+            defer right_child_ids.deinit(pager_ref.allocator);
+            try collectInternalState(&right_child, pager_ref.allocator, &right_keys, &right_child_ids);
+            for (right_keys.items) |k| {
+                try keys.append(pager_ref.allocator, try pager_ref.allocator.dupe(u8, k));
+            }
+            for (right_child_ids.items) |cid| {
+                try child_ids.append(pager_ref.allocator, cid);
+            }
+
+            try writeInternalNode(&left_child, keys.items, child_ids.items);
+        }
+
+        // Remove the right child from the parent node.
+        // Delete the separator key and shift child pointers.
+        try deleteInternalSeparator(parent_node, left_child_idx);
+
+        // Free the right page.
+        pager_ref.freePage(right_page_id) catch {};
+
+        // Root shrink: if root becomes a single child, make it the new root.
+        if (parent_page_id == self.root_page_id and parent_node.header.num_keys == 0 and parent_node.header.node_type == .internal) {
+            const sole_child = parent_node.getChildPageId(0);
+            const sole_page = try pager_ref.getPage(sole_child);
+            const root_page = try pager_ref.getPage(self.root_page_id);
+            @memcpy(root_page.data[0..PAGE_SIZE], sole_page.data[0..PAGE_SIZE]);
+            root_page.markDirty();
+            pager_ref.freePage(sole_child) catch {};
+        }
+    }
+
+    /// Delete the separator key at `index` from an internal node and shift child pointers.
+    fn deleteInternalSeparator(node: *BTreeNode, index: u16) !void {
+        std.debug.assert(node.header.node_type == .internal);
+        std.debug.assert(index < node.header.num_keys);
+
+        const key_infos = node.getKeyInfoPtr();
+        const num_keys: u16 = node.header.num_keys;
+
+        // Shift KeyInfo entries left
+        var i: u16 = index;
+        while (i < num_keys - 1) : (i += 1) {
+            key_infos[i] = key_infos[i + 1];
+        }
+
+        // Shift child pointers left (child at index+1 moves to index, etc.)
+        var j: u16 = index + 1;
+        while (j < num_keys) : (j += 1) {
+            const cid = node.getChildPageId(j + 1);
+            node.setChildPageId(j, cid);
+        }
+
+        node.header.num_keys -= 1;
+        node.saveHeader();
+    }
+
+    /// Try to borrow an entry from a sibling. Returns true if borrow succeeded.
+    fn tryBorrowFromLeft(pager_ref: *Pager, node: *BTreeNode, child_idx: u16, underflow_page_id: PageId) !bool {
+        if (child_idx == 0) return false;
+
+        const sibling_id = node.getChildPageId(child_idx - 1);
+        const sibling_page = try pager_ref.getPage(sibling_id);
+        var sibling = BTreeNode.init(sibling_page);
+
+        if (sibling.header.num_keys <= 1) return false;
+
+        const separator_key = getKey(node, child_idx - 1);
+        const underflow_page = try pager_ref.getPage(underflow_page_id);
+        var underflow_node = BTreeNode.init(underflow_page);
+
+        if (underflow_node.header.node_type == .leaf) {
+            // Borrow the rightmost entry from the left sibling.
+            const last_idx: u16 = sibling.header.num_keys - 1;
+            const borrowed_key = getKey(&sibling, last_idx);
+            const borrowed_value = getValue(&sibling, last_idx);
+
+            // Insert into the underflow node.
+            try insertLeafAtEnd(&underflow_node, borrowed_key, borrowed_value);
+
+            // Update separator to the new rightmost key of sibling.
+            const new_separator_idx: u16 = last_idx - 1;
+            const new_separator = getKey(&sibling, new_separator_idx);
+            try node.updateKey(child_idx - 1, new_separator);
+
+            // Remove borrowed entry from sibling.
+            try deleteLastFromNode(&sibling);
+        } else {
+            // Borrow from internal sibling — move separator down and sibling's rightmost key up.
+            const last_idx: u16 = sibling.header.num_keys - 1;
+            const borrowed_child = sibling.getChildPageId(last_idx + 1);
+
+            // Insert separator into underflow node as first entry.
+            try insertLeafAtStart(&underflow_node, separator_key, &.{});
+            underflow_node.setChildPageId(0, borrowed_child);
+            underflow_node.header.node_type = .internal;
+            underflow_node.saveHeader();
+
+            // Update separator in parent.
+            const new_separator = getKey(&sibling, last_idx - 1);
+            try node.updateKey(child_idx - 1, new_separator);
+
+            // Remove entry from sibling.
+            try deleteLastFromNode(&sibling);
+        }
+
+        return true;
+    }
+
+    fn tryBorrowFromRight(pager_ref: *Pager, node: *BTreeNode, child_idx: u16, underflow_page_id: PageId) !bool {
+        if (child_idx >= node.header.num_keys) return false;
+
+        const sibling_id = node.getChildPageId(child_idx + 1);
+        const sibling_page = try pager_ref.getPage(sibling_id);
+        var sibling = BTreeNode.init(sibling_page);
+
+        if (sibling.header.num_keys <= 1) return false;
+
+        const separator_key = getKey(node, child_idx);
+        const underflow_page = try pager_ref.getPage(underflow_page_id);
+        var underflow_node = BTreeNode.init(underflow_page);
+
+        if (underflow_node.header.node_type == .leaf) {
+            // Borrow the leftmost entry from the right sibling.
+            const first_key = getKey(&sibling, 0);
+            const first_value = getValue(&sibling, 0);
+
+            try insertLeafAtEnd(&underflow_node, first_key, first_value);
+
+            // Update separator in parent to sibling's new leftmost.
+            if (sibling.header.num_keys > 0) {
+                const new_separator = getKey(&sibling, 0);
+                try node.updateKey(child_idx, new_separator);
+            }
+
+            // Remove first entry from sibling.
+            try deleteFirstFromNode(&sibling);
+        } else {
+            const first_child = sibling.getChildPageId(0);
+            try insertLeafAtStart(&underflow_node, separator_key, &.{});
+            const last_pos = underflow_node.header.num_keys - 1;
+            underflow_node.setChildPageId(@intCast(last_pos + 1), first_child);
+            underflow_node.header.node_type = .internal;
+            underflow_node.saveHeader();
+
+            const new_separator = getKey(&sibling, 0);
+            try node.updateKey(child_idx, new_separator);
+
+            try deleteFirstFromNode(&sibling);
+        }
+
+        return true;
+    }
+
+    fn insertLeafAtEnd(node: *BTreeNode, key: []const u8, value: []const u8) !void {
+        const offset = node.getNextDataOffset();
+        const child_area_offset = PAGE_SIZE - @sizeOf(PageId) * (MAX_KEYS + 1);
+        const total = offset + key.len + value.len;
+        if (node.header.node_type == .internal or total > child_area_offset) {
+            return Error.PageOverflow;
+        }
+        const key_infos = node.getKeyInfoPtr();
+        @memcpy(node.page.data[offset..][0..key.len], key);
+        @memcpy(node.page.data[offset + key.len ..][0..value.len], value);
+        key_infos[node.header.num_keys] = .{
+            .key_offset = @intCast(offset),
+            .key_len = @intCast(key.len),
+            .value_offset = @intCast(offset + key.len),
+            .value_len = @intCast(value.len),
+        };
+        node.header.num_keys += 1;
+        node.saveHeader();
+    }
+
+    fn insertLeafAtStart(node: *BTreeNode, key: []const u8, value: []const u8) !void {
+        const offset = node.getNextDataOffset();
+        const child_area_offset = PAGE_SIZE - @sizeOf(PageId) * (MAX_KEYS + 1);
+        if (node.header.node_type != .leaf and node.header.node_type != .internal) {}
+        if (offset + key.len + value.len > child_area_offset) {
+            return Error.PageOverflow;
+        }
+        const key_infos = node.getKeyInfoPtr();
+        // Shift existing entries right.
+        var i: u16 = node.header.num_keys;
+        while (i > 0) : (i -= 1) {
+            key_infos[i] = key_infos[i - 1];
+        }
+        @memcpy(node.page.data[offset..][0..key.len], key);
+        @memcpy(node.page.data[offset + key.len ..][0..value.len], value);
+        key_infos[0] = .{
+            .key_offset = @intCast(offset),
+            .key_len = @intCast(key.len),
+            .value_offset = @intCast(offset + key.len),
+            .value_len = @intCast(value.len),
+        };
+        node.header.num_keys += 1;
+        node.saveHeader();
+    }
+
+    fn deleteLastFromNode(node: *BTreeNode) !void {
+        std.debug.assert(node.header.num_keys > 0);
+        node.header.num_keys -= 1;
+        node.saveHeader();
+    }
+
+    fn deleteFirstFromNode(node: *BTreeNode) !void {
+        std.debug.assert(node.header.num_keys > 0);
+        const key_infos = node.getKeyInfoPtr();
+        var i: u16 = 0;
+        while (i < node.header.num_keys - 1) : (i += 1) {
+            key_infos[i] = key_infos[i + 1];
+        }
+        node.header.num_keys -= 1;
+        node.saveHeader();
+    }
+
+    /// Recursive helper for delete with rebalancing.
     fn deleteRecursive(self: *BTree, pager_ref: *Pager, page_id: PageId, key: []const u8) !void {
         const page = try pager_ref.getPage(page_id);
         var node = BTreeNode.init(page);
         const result = node.findKey(key);
 
         if (node.header.node_type == .leaf) {
-            // Until borrow/merge/root-shrink land, deleting the last entry from a
-            // non-root leaf would create an underflow the current tree cannot fix.
-            if (result.found and page_id != self.root_page_id and node.header.num_keys == 1) {
-                return Error.NodeEmpty;
-            }
-
             try node.deleteLeaf(key);
             return;
         }
 
-        // Continue following the same separator-routing rule used by lookup and
-        // insert. Rebalancing and root shrink remain later work, but successful
-        // deletes still refresh parent separators so searches stay correct.
+        // Internal node: recurse into the correct child.
         const child_index = if (result.found) result.index + 1 else result.index;
-        try self.deleteRecursive(pager_ref, node.getChildPageId(child_index), key);
+        const child_page_id = node.getChildPageId(child_index);
+        try self.deleteRecursive(pager_ref, child_page_id, key);
+
+        // After return, check if the child underflowed.
+        const child_page = try pager_ref.getPage(child_page_id);
+        const child = BTreeNode.init(child_page);
+
+        // A node underflows when it has fewer than ceil(MAX_KEYS/2) entries.
+        // For simplicity, we check if num_keys < MAX_KEYS / 4 (more aggressive threshold).
+        const min_keys: u16 = @intCast(@max(1, MAX_KEYS / 4));
+
+        if (child.header.num_keys < min_keys) {
+            // Try to borrow from left sibling first.
+            if (try tryBorrowFromLeft(pager_ref, &node, child_index, child_page_id)) {
+                try self.normalizeInternalSeparators(&node, pager_ref);
+                return;
+            }
+            // Try to borrow from right sibling.
+            if (try tryBorrowFromRight(pager_ref, &node, child_index, child_page_id)) {
+                try self.normalizeInternalSeparators(&node, pager_ref);
+                return;
+            }
+            // Must merge. Prefer merging with left sibling if possible.
+            if (child_index > 0) {
+                try self.mergeChildren(pager_ref, &node, child_index - 1, page_id);
+            } else {
+                try self.mergeChildren(pager_ref, &node, child_index, page_id);
+            }
+        }
+
         try self.normalizeInternalSeparators(&node, pager_ref);
     }
 
